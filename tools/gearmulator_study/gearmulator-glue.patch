@@ -35,6 +35,12 @@ index 6ec2aef7..1263d761 100644
  			processUC();
  			processUC();
  			processUC();
+diff --git a/source/cpu/mc68k b/source/cpu/mc68k
+--- a/source/cpu/mc68k
++++ b/source/cpu/mc68k
+@@ -1 +1 @@
+-Subproject commit 1606a4db30a32f8cdcce4a391480f95471bcbc06
++Subproject commit 1606a4db30a32f8cdcce4a391480f95471bcbc06-dirty
 diff --git a/source/waldi/common/wLib/wHardware.cpp b/source/waldi/common/wLib/wHardware.cpp
 index 58a376d0..febfc7b6 100644
 --- a/source/waldi/common/wLib/wHardware.cpp

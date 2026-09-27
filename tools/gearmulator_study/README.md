@@ -30,10 +30,20 @@ differential comparator -- also already fixed for a tracer blind spot found alon
    user's microQ ROM, `~/roms/Waldorf Micro Q/...`, byte-swapped).
 2. The remaining divergence is DSP-side-innocent (cycle/instruction counters match exactly at the point of
    divergence; ruled out: spin-skip, whole-loop recompilation, block-granularity -- see ARM32_JIT.md for how
-   each was tested and rejected). It's most likely a 68k microcontroller-side timing difference. **Instrument
-   the uC side** (its own PC and cycle count) alongside the existing DSP `GM_REGTRACE` record and re-run the
-   same differential-comparator method that found the first two bugs -- don't re-guess DSP-side mechanisms,
-   they're fairly exhausted.
+   each was tested and rejected). It's most likely a 68k microcontroller-side timing difference. **The uC side
+   is now instrumented** (`mc68k::Mc68k::s_traceHook`, called from `Mc68k::exec()` in
+   `source/cpu/mc68k/mc68k.h`/`.cpp`, gated by `DSP56K_RECOMP_DISCOVERY`, in `gearmulator-glue.patch`).
+   `gm_probe.cpp`'s regtrace writer now takes an extra env var, `GM_REGTRACE_UC=1`, which installs the uC hook
+   too and writes both DSP and uC events into the *same* trace file in true call order (a `kind` byte
+   distinguishes them: 0=DSP, 1=uC). This lets you diff the actual interleaving order between builds, not just
+   each side's own counters -- which is what's needed if the bug is a scheduling/turn-order drift rather than
+   either side computing a wrong value in isolation. Build both interpreter and recompiled lock-step binaries
+   with `-DDSP56K_RECOMP_DISCOVERY` (same as previous `GM_REGTRACE` runs) and rerun with `GM_REGTRACE=<path>
+   GM_REGTRACE_CAP=<n> GM_REGTRACE_UC=1`, then diff the two trace files record-by-record (same mmap/diff
+   approach as before, just also compare `kind` and the uC's `pc`/`cycles` fields) to find the first point
+   where the two builds' interleaving orders (not just contents) disagree. **Not yet run** -- this session
+   only added the instrumentation; the actual rebuild + 16M-instruction comparison pass is the next concrete
+   step, budget real wall-clock time for it (discovery regen + two full builds, as before).
 3. Once bit-exact (or a second real bug is found and fixed), re-measure Force timing (last measured: 4.75x
    real time, worse than the interpreter's own eventual target of 100%; a proper Stage-3-style optimisation
    pass, never done for this synth, is likely needed before it's usable in the port).

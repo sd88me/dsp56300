@@ -17,6 +17,7 @@
 #include "synthLib/romLoader.h"
 #include "baseLib/logging.h"
 #include "dsp56kEmu/dsp.h"
+#include "mc68k.h"
 
 #if defined(GM_SYNTH_VIRUS)
 #include "virusLib/device.h"
@@ -141,14 +142,24 @@ namespace regtrace {
 FILE* g_file = nullptr;
 uint64_t g_count = 0, g_cap = 0;
 #pragma pack(push, 1)
-struct Rec { uint32_t pc; uint64_t a; uint64_t b; uint32_t sr; uint64_t dspCycles; uint64_t dspInstr; };
+// kind 0 = DSP instruction, kind 1 = uC (68k) instruction. Both hooks write into the same file, in true
+// call order, so the interleaving itself (not just each side's own counters) can be diffed between builds --
+// this is what's needed to catch a scheduling/ordering divergence that leaves each side's own counters intact.
+struct Rec { uint8_t kind; uint8_t pad[7]; uint32_t pc; uint64_t a; uint64_t b; uint32_t sr; uint64_t cycles; uint64_t instr; };
 #pragma pack(pop)
-void hook(dsp56k::DSP* d, dsp56k::TWord pc) {
+void hookDsp(dsp56k::DSP* d, dsp56k::TWord pc) {
 	if (g_count >= g_cap) { std::fclose(g_file); fprintf(stderr, "regtrace: cap reached, wrote %llu records\n", (unsigned long long)g_count); _exit(0); }
-	Rec r{pc, d->regs().a.var, d->regs().b.var, d->regs().sr.var, d->getCycles(), d->getInstructionCounter()};
+	Rec r{}; r.kind = 0; r.pc = pc; r.a = d->regs().a.var; r.b = d->regs().b.var; r.sr = d->regs().sr.var; r.cycles = d->getCycles(); r.instr = d->getInstructionCounter();
 	std::fwrite(&r, sizeof(r), 1, g_file);
 	++g_count;
 	if ((g_count & 0xffff) == 0) std::fflush(g_file);	// survives a kill -9 if the workload never naturally ends
+}
+void hookUc(mc68k::Mc68k* u, uint32_t pc, uint64_t cycles) {
+	if (g_count >= g_cap) { std::fclose(g_file); fprintf(stderr, "regtrace: cap reached, wrote %llu records\n", (unsigned long long)g_count); _exit(0); }
+	Rec r{}; r.kind = 1; r.pc = pc; r.cycles = cycles;
+	std::fwrite(&r, sizeof(r), 1, g_file);
+	++g_count;
+	if ((g_count & 0xffff) == 0) std::fflush(g_file);
 }
 }
 #endif
@@ -172,7 +183,8 @@ int main(int argc, char** argv)
 	if (const char* rt = getenv("GM_REGTRACE")) {
 		regtrace::g_file = std::fopen(rt, "wb");
 		regtrace::g_cap = getenv("GM_REGTRACE_CAP") ? strtoull(getenv("GM_REGTRACE_CAP"), nullptr, 10) : 3000000ull;
-		dsp56k::DSP::s_recompTraceHook = &regtrace::hook;
+		dsp56k::DSP::s_recompTraceHook = &regtrace::hookDsp;
+		if (getenv("GM_REGTRACE_UC")) mc68k::Mc68k::s_traceHook = &regtrace::hookUc;
 	}
 #endif
 	RomLoader::setSearchPath(dir);
