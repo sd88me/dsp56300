@@ -1052,9 +1052,13 @@ namespace dsp56k
 		bool	memWritePeriphFFFF80( EMemArea _area, TWord _offset, TWord _value );
 		bool	memWritePeriphFFFFC0( EMemArea _area, TWord _offset, TWord _value );
 
-	private:
+	public:
+		// public so callers that write P memory outside memWriteP's own path (e.g. the boot protocol's
+		// direct memory().set(), which needs the JIT's own invalidation too) can still invalidate the
+		// static-recompilation cache and the per-address opcode cache.
 		void	notifyProgramMemWrite(TWord _offset);
-		
+
+	private:
 		TWord	memRead				( EMemArea _area, TWord _offset ) const;
 		void	memReadOpcode		( TWord _offset, TWord& _wordA, TWord& _wordB ) const;
 		TWord	memReadPeriph		( EMemArea _area, TWord _offset, Instruction _inst) const;

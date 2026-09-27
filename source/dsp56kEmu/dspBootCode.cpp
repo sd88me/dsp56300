@@ -53,6 +53,11 @@ namespace dsp56k
 		case State::Data:
 			m_dsp.memory().set(MemArea_P, m_address, _val);
 			m_dsp.getJit().notifyProgramMemWrite(m_address);
+			// Also invalidate the static recompiler's per-block verification cache, not just the JIT's: a
+			// block that verified true against not-yet-fully-streamed P words would otherwise stay cached
+			// forever, since nothing else invalidates it once the rest of this boot transfer overwrites
+			// those same words.
+			m_dsp.notifyProgramMemWrite(m_address);
 			++m_address;
 			if(0 == --m_remaining)
 			{

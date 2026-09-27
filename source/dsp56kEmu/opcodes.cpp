@@ -26,8 +26,6 @@ namespace dsp56k
 		}
 	};
 
-	const RuntimeFieldInfos g_runtimeFieldInfos;
-
 	static_assert(getFieldInfoCE<Bsset_S, Field_DDDDDD>().bit == 8, "invalid");
 	static_assert(getFieldInfoCE<Bsset_S, Field_DDDDDD>().len == 6, "invalid");
 	static_assert(getFieldInfoCE<Bsset_S, Field_bbbbb>().bit == 0, "invalid");
@@ -40,6 +38,12 @@ namespace dsp56k
 
 	const FieldInfo& getFieldInfo(const Instruction _i, const Field _f)
 	{
+		// Function-local static, not a namespace-scope global: any translation unit that constructs its own
+		// Opcodes object at static-init time (as a global/namespace-scope variable, not a local inside main())
+		// races this initializer across TUs, since C++ does not order dynamic initialization between them
+		// (the static initialization order fiasco). A function-local static is guaranteed initialized on
+		// first use instead, regardless of what else runs at static-init time.
+		static const RuntimeFieldInfos g_runtimeFieldInfos;
 		return g_runtimeFieldInfos.fieldInfos[_i].fieldInfos[_f];
 	}
 
