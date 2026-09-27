@@ -903,3 +903,44 @@ Practical effect: this is a **narrow, boot-time-only skip** of a rarely-taken (8
 instruction, not a hang and not (as far as tested) audible corruption -- the build completes, is internally
 deterministic, and produces plausible audio (sent to the user). It should be fixed before calling Vavra's
 recompiler bit-exact, but does not block further real-world testing.
+
+## Second divergence, continued (2026-09-27, still later): tracer bug fixed, then a real remaining one found
+
+**Fixed a real bug in the diagnostic tool itself.** `GM_REGTRACE`'s hook only fired from plain
+`execInterpreter()`; `execRecompiledLoopBody()` and `execRecompiledLoop()` bypass that function entirely
+(they call the resolved block/loop function directly), so any instruction executed via those fast paths was
+invisible to the trace. This made the earlier-reported "$000966 skipped" divergence a **false positive**:
+with the hook added to both fast paths (`dsp.h`, gated by the existing `DSP56K_RECOMP_DISCOVERY` macro, kept
+permanently), a re-run confirmed the recompiled build executes P:$000966 correctly, every single time
+(8000+ direct confirmations via a separate `do_exec()`-level instrumentation pass), and the two builds match
+bit-for-bit, cycle-for-cycle, for the first 15 million instructions.
+
+**A real divergence remains further in.** Extending the corrected comparator to 100M instructions finds it at
+instruction #16,261,375 (well past the first 15M that matched): the DSP's own cycle *and* instruction
+counters are identical between builds at this point, then a single instruction's cost differs by a small,
+non-repeating amount (10 cycles / 2 instructions), and PC trajectories fully diverge soon after (full-program
+divergence within ~10M more instructions). A second, independent occurrence (found on a build without
+`DSP56K_SPIN_SKIP` at all) shows the same signature at a different, simpler-looking spot: two builds at
+*identical* DSP cycle and instruction counts take different branches on the exact same `jset`/`jclr`-style
+poll instruction (P:$0001db, itself always interpreter-only, `kind=2`) at instruction #13,262,919.
+
+**Ruled out by direct experiment** (each rebuilt and rerun to a full audio hash comparison, not just the
+first differing index): `DSP56K_SPIN_SKIP` (disabled entirely, still diverges elsewhere); whole-loop
+recompilation (`recompLoop`, disabled via `recomp_gen_gm_noloop.py`, still diverges); block-size/granularity
+(forced `MAX_INSTR=1`, so every `exec()` call is exactly one instruction like the interpreter, still
+diverges). None of these change the outcome, which rules out "the recompiler runs bursts the lock-step
+scheduler can't interrupt" as the explanation.
+
+**What's left, precisely:** at the second divergence, the instruction is `kind=2` (always interpreter-only,
+identical code path in both builds) and DSP-side cycle/instruction counters match exactly, yet it evaluates
+differently -- meaning the *peripheral/memory value it polls* differs, which can only come from something
+outside the traced DSP registers: most likely the 68k microcontroller having taken a different number of
+turns by this exact DSP-cycle count. The uC side isn't instrumented at all in this trace; that's the natural
+next step (log the uC's own PC/cycle count alongside the DSP trace) rather than continuing to guess at DSP-
+side mechanisms, which are now fairly thoroughly excluded.
+
+**Housekeeping:** `GM_REGTRACE`'s record gained a `dspInstr` field (the DSP's own instruction counter,
+alongside pc/a/b/sr/dspCycles) -- keep it, it was essential for this pass. The one-off `DSP56K_DOEXEC_DEBUG`
+instrumentation used to confirm the tracer bug was reverted (not kept); the `s_recompTraceHook` calls added
+to `execRecompiledLoopBody()`/`execRecompiledLoop()` in `dsp.h` are kept permanently -- any future
+recompiler diagnostic work depends on the tracer actually seeing every instruction.

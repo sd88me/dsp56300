@@ -196,6 +196,9 @@ namespace dsp56k
 			if(ASMJIT_UNLIKELY(m_recompState[bi] != 1) && !recompVerify(bi))
 				return false;
 			pcCurrentInstruction = pc;
+#ifdef DSP56K_RECOMP_DISCOVERY
+			if(s_recompTraceHook) s_recompTraceHook(this, pc);	// this path bypasses execInterpreter() entirely
+#endif
 #ifdef DSP56K_RECOMP_STATS
 			++m_recompExecuted;
 #endif
@@ -220,6 +223,9 @@ namespace dsp56k
 			if(ASMJIT_UNLIKELY(m_recompState[bi] != 1) && !recompVerify(bi))
 				return false;
 			pcCurrentInstruction = pc;
+#ifdef DSP56K_RECOMP_DISCOVERY
+			if(s_recompTraceHook) s_recompTraceHook(this, pc);	// this path bypasses execInterpreter() entirely (and runs the whole loop internally)
+#endif
 #ifdef DSP56K_RECOMP_STATS
 			++m_recompExecuted;
 #endif
