@@ -141,11 +141,11 @@ namespace regtrace {
 FILE* g_file = nullptr;
 uint64_t g_count = 0, g_cap = 0;
 #pragma pack(push, 1)
-struct Rec { uint32_t pc; uint64_t a; uint64_t b; uint32_t sr; };
+struct Rec { uint32_t pc; uint64_t a; uint64_t b; uint32_t sr; uint64_t dspCycles; };
 #pragma pack(pop)
 void hook(dsp56k::DSP* d, dsp56k::TWord pc) {
 	if (g_count >= g_cap) { std::fclose(g_file); fprintf(stderr, "regtrace: cap reached, wrote %llu records\n", (unsigned long long)g_count); _exit(0); }
-	Rec r{pc, d->regs().a.var, d->regs().b.var, d->regs().sr.var};
+	Rec r{pc, d->regs().a.var, d->regs().b.var, d->regs().sr.var, d->getCycles()};
 	std::fwrite(&r, sizeof(r), 1, g_file);
 	++g_count;
 	if ((g_count & 0xffff) == 0) std::fflush(g_file);	// survives a kill -9 if the workload never naturally ends

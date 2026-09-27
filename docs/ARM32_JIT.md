@@ -872,3 +872,34 @@ not one-off hacks.
 
 Sent to the user: a 10s render from this fixed recompiled build, and one from the plain interpreter for
 comparison (same script). Both complete; correctness between them is not yet proven bit-exact per above.
+
+## Second divergence, narrowed further (2026-09-27, still later)
+
+Re-ran the differential comparator (now with the DSP's own cycle count added to each trace record,
+`GM_REGTRACE`'s `Rec` gained a `dspCycles` field) past the first fix, to check the cycle-accounting theory
+directly. **Cycle counts match exactly, instruction for instruction, right up to the divergence** (both
+builds show identical `dspCycles` at every matching PC through a ~2.88M-iteration hot loop at P:$000963-965) --
+this rules out per-block `DSP56K_INTERP_CYCLES` summation error as the cause of this second divergence.
+
+The actual divergence: at the exact instruction where the interpreter falls through the loop's last body PC
+($000965, a `DO` loop end) to $000966 (the instruction immediately after the loop, executed 8,382 times
+total vs. the loop body's 2.88M), the recompiled build skips $000966 entirely and lands on $000967 instead.
+$000966 does have its own generated block (confirmed present in the `.inl`, correctly a leader since it's
+`loopend+1`), so it isn't simply missing from generation.
+
+Narrowed to (not yet pinned exactly): `DSP::execRecompiledLoopBody()` only runs a recompiled block as a
+loop-body step when that block's own span reaches exactly `la+1` (`b.pc + b.numWords != reg.la.toWord() + 1`
+=> `return false`); a 1-to-3-instruction non-loop block within the loop body (this loop's block at $000963 is
+not a `recompLoop`, `loop_body_ok` apparently rejected it) fails that check and falls back to plain
+`execInterpreter()` for every iteration -- which should be equivalent, and cycle counts through the loop
+confirm it is. The actual skip happens at the boundary where `do_exec()`'s own loop-exit sets PC to `la+1`
+and returns; suspect is in how control resumes into recompiled code after that return (if the `DO` instruction
+that started this loop was itself reached from a recompiled block, whatever that block does with PC after
+`op_Do_xxx()` returns needs checking), but this was not confirmed before time ran out on this pass --
+next step is to trace whether the code immediately preceding P:$000963's loop is itself recompiled, and if
+so read that specific generated block's handling of the `DO` instruction and what it does with PC afterward.
+
+Practical effect: this is a **narrow, boot-time-only skip** of a rarely-taken (8,382 of ~2.9M) post-loop
+instruction, not a hang and not (as far as tested) audible corruption -- the build completes, is internally
+deterministic, and produces plausible audio (sent to the user). It should be fixed before calling Vavra's
+recompiler bit-exact, but does not block further real-world testing.
