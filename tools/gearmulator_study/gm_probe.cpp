@@ -15,6 +15,7 @@
 
 #include "synthLib/device.h"
 #include "synthLib/romLoader.h"
+#include "baseLib/logging.h"
 #include "dsp56kEmu/dsp.h"
 
 #if defined(GM_SYNTH_VIRUS)
@@ -31,6 +32,96 @@
 #include "n2xLib/n2xromloader.h"
 #endif
 
+#if defined(GM_SYNTH_MQ) && defined(GM_LOCKSTEP)
+namespace mqLib { extern uint64_t g_lsProfDspNs, g_lsProfUcNs, g_lsProfUcCycles; }
+#endif
+
+#ifdef GM_DISCOVER
+// ---- recompiler discovery (see tools/arm32jit_prototype/recomp/mnm_recomp_discover.cpp for the format) ----
+#include <map>
+#include <set>
+#include <tuple>
+#include <dlfcn.h>
+#include "dsp56kEmu/opcodes.h"
+#include "dsp56kEmu/opcodeanalysis.h"
+#include "dsp56kEmu/opcodecycles.h"
+namespace disc {
+using namespace dsp56k;
+std::map<TWord, uint64_t> g_runCount;
+std::map<TWord, std::pair<TWord, TWord>> g_firstWords;
+uint64_t g_conflicts = 0;
+std::map<TWord, uint64_t> g_conflictPcs;
+std::set<TWord> g_entries, g_loopEnds;
+TWord g_expectedNext = 0xffffffff;
+Opcodes g_ops;
+TWord lengthAt(DSP* d, TWord pc) {
+	const TWord a = d->memory().get(MemArea_P, pc);
+	Instruction ia = Nop, ib = Invalid;
+	if (a) g_ops.getInstructionTypes(a, ia, ib);
+	const auto len = Opcodes::getOpcodeLength(a, ia, ib);
+	return len ? len : 1;
+}
+void hook(DSP* d, TWord pc) {
+	++g_runCount[pc];
+	const TWord a = d->memory().get(MemArea_P, pc), b = d->memory().get(MemArea_P, pc + 1);
+	auto it = g_firstWords.find(pc);
+	if (it == g_firstWords.end()) g_firstWords[pc] = {a, b};
+	else if (it->second.first != a) { ++g_conflicts; ++g_conflictPcs[pc]; }
+	if (pc != g_expectedNext) g_entries.insert(pc);
+	if (d->regs().sr.var & SR_LF) g_loopEnds.insert(TWord(d->regs().la.var));
+	g_expectedNext = pc + lengthAt(d, pc);
+}
+uintptr_t off(void* p) { Dl_info i{}; return p && dladdr(p, &i) ? uintptr_t(p) - uintptr_t(i.dli_fbase) : 0; }
+void write(const char* path) {
+	DSP& d = *DSP::firstRegistered();
+	FILE* f = std::fopen(path, "w");
+	for (const auto& [pc, n] : g_runCount) {
+		const TWord a = d.memory().get(MemArea_P, pc), b = d.memory().get(MemArea_P, pc + 1);	// final contents, consistent with the resolved handlers
+		Instruction ia = Nop, ib = Invalid;
+		if (a) g_ops.getInstructionTypes(a, ia, ib);
+		const TWord len = Opcodes::getOpcodeLength(a, ia, ib);
+		const auto ri = d.getRecompInfo(pc);
+		const auto flags = Opcodes::getFlags(ia, ib);
+		RegisterMask written = RegisterMask::None, read = RegisterMask::None;
+		Opcodes::getRegisters(written, read, a, ia, ib);
+		constexpr auto ctrl = RegisterMask::PC | RegisterMask::LA | RegisterMask::LC | RegisterMask::SSH | RegisterMask::SSL |
+		                      RegisterMask::SP | RegisterMask::SC | RegisterMask::EP | RegisterMask::SZ | RegisterMask::EMR |
+		                      RegisterMask::MR | RegisterMask::OMR;
+		int kind = 0;
+		auto isPoll = [](Instruction i) { return i == Jset_pp || i == Jclr_pp || i == Jset_qq || i == Jclr_qq || i == Brset_pp || i == Brclr_pp || i == Brset_qq || i == Brclr_qq; };
+		if (!ri.resolved || (flags & (OpFlagLoop | OpFlagRepDynamic | OpFlagRepImmediate)) || ia == Wait || ia == Ifcc ||
+		    ia == Ifcc_U || ib == Ifcc || ib == Ifcc_U || isPoll(ia) || isPoll(ib))
+			kind = 2;
+		else if ((flags & (OpFlagBranch | OpFlagPopPC)) || (written & ctrl) != RegisterMask::None)
+			kind = 1;
+		bool moveAB = true;
+		uint64_t pmr = 0, pmw = 0, par_ = 0, paw = 0;
+		if (ri.parallel) {
+			RegisterMask mw = RegisterMask::None, mr = RegisterMask::None, aw = RegisterMask::None, ar = RegisterMask::None;
+			Opcodes::getRegisters(mw, mr, a, ib, Invalid);
+			Opcodes::getRegisters(aw, ar, a, ia, Invalid);
+			auto touches = [](RegisterMask m, RegisterMask acc) { return (m & acc) != RegisterMask::None; };
+			moveAB = (touches(aw, RegisterMask::A) && touches(mw | mr, RegisterMask::A)) ||
+			         (touches(aw, RegisterMask::B) && touches(mw | mr, RegisterMask::B));
+			pmr = uint64_t(mr); pmw = uint64_t(mw); par_ = uint64_t(ar); paw = uint64_t(aw);
+		}
+		const bool readsPC = (read & RegisterMask::PC) != RegisterMask::None;
+		const int ccr = int((read & RegisterMask::CCR) != RegisterMask::None) |
+		                int((written & RegisterMask::CCR) != RegisterMask::None || (flags & OpFlagCCR)) << 1 |
+		                int((flags & OpFlagCondition) != 0) << 2;
+		const uint32_t cy = a ? calcCycles(ia, ib, pc, a, 0, 1) : 1;
+		std::fprintf(f, "I %06x %06x %06x %u %d %d %zx %zx %zx %llu %d %d %d %llx %llx %llx %llx %u\n", pc, a, b, len ? len : 1,
+		             kind, int(ri.parallel), off(ri.op), off(ri.opMove), off(ri.opAlu), (unsigned long long)n, int(moveAB), int(readsPC), ccr,
+		             (unsigned long long)pmr, (unsigned long long)pmw, (unsigned long long)par_, (unsigned long long)paw, cy);
+	}
+	for (auto e : g_entries) std::fprintf(f, "E %06x\n", e);
+	for (auto l : g_loopEnds) std::fprintf(f, "L %06x\n", l);
+	std::fclose(f);
+	for (const auto& [pc, n] : g_conflictPcs) if (n > 100000) std::fprintf(stderr, "  conflicting pc %06x: %llu executions of a different word\n", pc, (unsigned long long)n);
+	std::fprintf(stderr, "discovery: %zu distinct pcs, %llu word conflicts (address held different code)\n", g_runCount.size(), (unsigned long long)g_conflicts);
+}
+}
+#endif
 using namespace synthLib;
 using clk = std::chrono::steady_clock;
 
@@ -43,6 +134,10 @@ int main(int argc, char** argv)
 	const double seconds = argc > 2 ? atof(argv[2]) : 20.0;
 	FILE* dump = argc > 3 ? fopen(argv[3], "wb") : nullptr;
 
+#ifdef GM_DISCOVER
+	dsp56k::DSP::s_recompTraceHook = &disc::hook;
+#endif
+	if (!getenv("GM_LOG")) Logging::setLogFunc([](const std::string&) {});	// this device's LOG() macro is unconditional and dominates runtime otherwise
 	RomLoader::setSearchPath(dir);
 	DeviceCreateParams p;
 #if defined(GM_SYNTH_VIRUS)
@@ -79,12 +174,16 @@ int main(int argc, char** argv)
 	std::vector<SMidiEvent> midiIn, midiOut;
 	auto ev = [&](uint8_t a, uint8_t b, uint8_t c) { midiIn.emplace_back(MidiEventSource::Host, a, b, c, 0u); };
 
+	const bool wide = getenv("GM_WIDE") != nullptr;
 	const uint64_t blocks = static_cast<uint64_t>(seconds * sr / block);
 	// the script: every 1.0 s a new program + chord + CC sweep, chord released after 0.7 s
 	const uint64_t period = static_cast<uint64_t>(sr / block);
 	static const uint8_t chord[] = {36, 48, 55, 60, 64, 67, 72, 79};
 	static const uint8_t ccs[] = {1, 74, 71, 73, 72, 91, 93, 5, 7, 10};
 
+#if defined(GM_SYNTH_MQ) && defined(GM_LOCKSTEP)
+	mqLib::g_lsProfDspNs = mqLib::g_lsProfUcNs = mqLib::g_lsProfUcCycles = 0;	// profile the workload, not the boot
+#endif
 	const uint64_t i0 = dsp56k::DSP::execCountAll();
 	const auto t0 = clk::now();
 	for (uint64_t b = 0; b < blocks; ++b)
@@ -103,9 +202,34 @@ int main(int argc, char** argv)
 			const uint8_t cc = ccs[(step + ph / 8) % 10];
 			ev(0xb0, cc, static_cast<uint8_t>(((ph * 3 + step * 29) * 5) & 127));
 		}
+		if (wide)
+		{
+			static uint32_t rng = 12345;
+			auto rnd = [&]() { rng = rng * 1664525u + 1013904223u; return rng >> 8; };
+			if (ph > 0 && ph % (period / 24) == 0)
+			{
+				SMidiEvent e(MidiEventSource::Host);
+				const uint32_t idx = rnd() % 392;
+				e.sysex = {0xf0, 0x3e, 0x10, 0x7f, 0x20, 0x20, static_cast<uint8_t>(idx >> 7), static_cast<uint8_t>(idx & 0x7f), static_cast<uint8_t>(rnd() & 0x7f), 0xf7};
+				midiIn.push_back(e);
+			}
+			if (ph > 0 && ph % (period / 12) == 3)
+			{
+				ev(0xb0, static_cast<uint8_t>(1 + rnd() % 119), static_cast<uint8_t>(rnd() & 127));
+				ev(0xe0, static_cast<uint8_t>(rnd() & 127), static_cast<uint8_t>(rnd() & 127));
+				ev(0xd0, static_cast<uint8_t>(rnd() & 127), 0);
+			}
+			if (ph % 40 == 0 && (step % 3) != 0) ev(0xf8, 0, 0);
+			if (ph == 5 && (step % 6) == 1) ev(0xfa, 0, 0);
+			if (ph == 5 && (step % 6) == 4) ev(0xfc, 0, 0);
+			if (ph == 7 && (step % 4) == 2) ev(0xb0, 64, 127);
+			if (ph == period * 9 / 10 && (step % 4) == 2) ev(0xb0, 64, 0);
+		}
 		if (ph == period * 7 / 10)
 			for (int k = 0; k < 8; ++k) ev(0x80, chord[k], 0);
 		dev->process(ins, outs, block, midiIn, midiOut);
+		if (getenv("GM_PROGRESS") && (b & 0x3ff) == 0)
+			fprintf(stderr, "progress: block=%llu/%llu instr=%llu\n", (unsigned long long)b, (unsigned long long)blocks, (unsigned long long)dsp56k::DSP::execCountAll());
 		for (size_t s = 0; s < block; ++s)
 			for (uint32_t c = 0; c < nOut && c < 12; ++c)
 			{
@@ -134,7 +258,14 @@ int main(int argc, char** argv)
 		}
 		if (d) closedir(d);
 	}
+#if defined(GM_SYNTH_MQ) && defined(GM_LOCKSTEP)
+	if (getenv("GM_LSPROF"))
+		printf("lockstep profile: dsp=%.2fs uc=%.2fs (uc cycles %.1fM = %.1f Mcycles/s of uc time)\n", mqLib::g_lsProfDspNs / 1e9, mqLib::g_lsProfUcNs / 1e9, mqLib::g_lsProfUcCycles / 1e6, mqLib::g_lsProfUcCycles / 1e6 / (mqLib::g_lsProfUcNs / 1e9));
+#endif
 	printf("spin_skipped=%llu\n", (unsigned long long)dsp56k::DSP::spinSkippedAll());
+#ifdef GM_DISCOVER
+	if (getenv("GM_TRACE")) disc::write(getenv("GM_TRACE"));
+#endif
 	if (getenv("GM_HOT")) dsp56k::DSP::dumpHotAll(static_cast<size_t>(atoi(getenv("GM_HOT"))));
 	if (dump) fclose(dump);
 	fflush(stdout);

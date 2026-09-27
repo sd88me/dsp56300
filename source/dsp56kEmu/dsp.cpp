@@ -107,6 +107,7 @@ namespace dsp56k
 			}
 		}
 	}
+	DSP* DSP::firstRegistered() { std::lock_guard l(g_execMutex); auto& r = execRegistry(); return r.empty() ? nullptr : const_cast<DSP*>(r.front()); }
 	uint64_t DSP::spinSkippedAll()
 	{
 #ifdef DSP56K_SPIN_SKIP

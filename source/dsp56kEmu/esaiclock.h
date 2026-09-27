@@ -55,6 +55,7 @@ namespace dsp56k
 		void restartClock();
 
 		TWord getRemainingInstructionsForFrameSync() const;
+		auto getCyclesPerSampleValue() const { return m_cyclesPerSample; }	// gearmulator study: lock-step uC scheduling
 
 	protected:
 		auto getDspInstructionCounter() const { return *m_dspInstructionCounter; }

@@ -764,3 +764,59 @@ public Legacy Wave System.zip; the loader checks hashes; wavetable images option
 ASIC model, so the DSP recompiler is irrelevant; the question there is the cost of the 68000 cores and the ASIC
 voice model (its README mentions 3 worker threads at high polyphony) and whether the JUCE build works on Linux/armhf
 (its targets are macOS AU/VST3/AAX plus standalone).
+
+## Vavra lock-step + recompiler attempt (2026-09-27, later)
+
+Goal: a deterministic single-thread build of Vavra (needed so the recompiled build's output can be hashed
+against the interpreter's, per the correctness gate), then run the recompiler on it.
+
+**Lock-step mode (`GM_LOCKSTEP`, off by default) works and is bit-exact.** `wLib::Hardware` gets a
+`lockstepStepDsp()` hook; `mqLib` runs the uC and DSP on one thread, the uC's own thread disabled, every
+`ucYieldLoop`/wait call replaced by stepping the DSP directly, and the ESAI's blocking ring-buffer callback
+replaced by a non-blocking one (`MqDsp::onDspBootFinished`). A budget in DSP cycles (converted to uC cycles via
+the ESAI clock's cycles-per-sample, x2 for two slots per frame) decides whose turn it is
+(`Hardware::lockstepRun`/`lockstepStepDsp`). Verified deterministic: identical output hash across repeated runs,
+on x86 and on the Force (interpreter build only -- see below). Sample: 10s render at
+`tools/gearmulator_study/` scratch, sent to the user.
+
+**The recompiler does not work on Vavra yet -- a real, reproducible correctness bug, not yet fixed.** The
+recompiled + lock-step build gets stuck in a genuine infinite retry loop at P:$013b2-$013ed (an HDI08
+host-command poll) that the interpreter's own discovery trace shows executing only 10-45 times in a full
+reference run. Confirmed with instrumentation (periodic dumps of DSP/uC cycle counts, PC, budget, boot-reset
+count): both builds hit the SAME sequence of boot-time DSP resets at the SAME uC cycle counts (0->1->2->3,
+identical between interpreter and recompiled -- this part of the protocol is uC-only and unaffected by DSP
+recompilation). The divergence starts exactly when the DSP begins REAL execution after the 3rd reset: the
+interpreter passes through the poll quickly and boots; the recompiled build enters it and never leaves (still
+looping after 75M+ DSP cycles, `running=1`, PC cycling through the same ~10 addresses, budget still trading
+turns normally with the uC -- so it is not a scheduler starvation bug).
+
+Ruled out by direct experiment (each rebuilt and rerun, still hangs):
+- **Block coalescing / once-per-block peripheral ticking** -- forced `MAX_INSTR=1` (every block is a single
+  instruction, closest possible to interpreter granularity). Still hangs.
+- **`movep` (the actual HDI08-register instructions in the loop)** -- forced kind=2 (interpreter-only,
+  never recompiled) for every instruction whose handler name contains `Movep`. Still hangs at the exact
+  same PCs, now via the interpreter fallback, which rules out a bug in generating movep specifically.
+- **Self-modifying code / bank-switched instruction words** -- checked the discovery trace used to build this
+  `.inl`: zero PCs hold more than one distinct opcode word (the Monomodule assumption holds for this trace,
+  unlike a wider 40s trace taken later which does have ~47M such conflicts elsewhere, but that trace was never
+  used to generate this `.inl`).
+- **Dead-CCR elimination** (`recomp_gen2.py`'s known-fragile pass, flagged in its own comments as relying on
+  incomplete opcode masks) -- disabled entirely (`is_killer` forced false). Still hangs.
+
+Remaining suspects, not yet tested: the per-block DSP-cycle summation added for this synth
+(`DSP56K_INTERP_CYCLES`, needed because mQ/XT/n2x clock the ESAI from DSP cycles and the plain interpreter
+never counted them) -- unlike everything else in the recompiler, this is new code, not carried over from the
+Monomodule-proven pipeline, and a per-block-summed cycle count could show a stale value to an instruction
+mid-block that reads the clock to make a timing decision, even though MAX_INSTR=1 should have equalised that
+granularity (still hung, so this alone may not explain it either -- needs the actual differential/single-step
+comparator Stage 1 used for Monomodule, which was not built for this session).
+
+Everything needed to resume this is in `tools/gearmulator_study/`: `recomp_gen_gm.py` (the gearmulator variant
+of `recomp_gen2.py`, adds the DSP-cycle column and the Movep exclusion), `gm_probe.cpp` (`GM_LOCKSTEP`,
+`GM_DISCOVER`, `GM_HOT`, `GM_WIDE`, `GM_LSDEBUG` env vars document themselves at point of use), and
+`gearmulator-glue.patch` (the full diff against `dsp56300/gearmulator` main, including the lock-step wiring).
+
+**Next step if this is picked up again:** build the Stage-1-style differential comparator (run interpreted and
+recompiled DSP instances side by side from identical state, diff full registers after every instruction, not
+just instruction counts) to find the exact first point of divergence, rather than continuing to guess-and-check
+whole mechanisms.

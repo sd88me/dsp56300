@@ -35,8 +35,62 @@ index 6ec2aef7..1263d761 100644
  			processUC();
  			processUC();
  			processUC();
+diff --git a/source/waldi/common/wLib/wHardware.cpp b/source/waldi/common/wLib/wHardware.cpp
+index 58a376d0..febfc7b6 100644
+--- a/source/waldi/common/wLib/wHardware.cpp
++++ b/source/waldi/common/wLib/wHardware.cpp
+@@ -43,6 +43,11 @@ namespace wLib
+ 
+ 	void Hardware::ucYieldLoop(const std::function<bool()>& _continue)
+ 	{
++#ifdef GM_LOCKSTEP
++		while(_continue() && !m_terminateUcThread)
++			lockstepStepDsp();
++		return;
++#endif
+ 		const auto dspHalted = m_haltDSP;
+ 
+ 		resumeDSP();
+@@ -105,6 +110,10 @@ namespace wLib
+ 
+ 		processMidiInput();
+ 
++#ifdef GM_LOCKSTEP
++		return;
++#endif
++
+ 		if((m_esaiFrameIndex & (g_syncEsaiFrameRate-1)) == 0)
+ 			m_esaiFrameAddedCv.notify_one();
+ 
+diff --git a/source/waldi/common/wLib/wHardware.h b/source/waldi/common/wLib/wHardware.h
+index 50b8048c..b4cf159c 100644
+--- a/source/waldi/common/wLib/wHardware.h
++++ b/source/waldi/common/wLib/wHardware.h
+@@ -49,6 +49,12 @@ namespace wLib
+ 
+ 		uint32_t getEsaiFrameIndex() const { return m_esaiFrameIndex; }
+ 
++#ifdef GM_LOCKSTEP
++		// arm32 study: single-thread deterministic mode. The uC and the DSP are stepped by whoever calls
++		// processAudio(); every place that used to wait for the other thread steps the DSP instead.
++		virtual void lockstepStepDsp() {}
++#endif
++
+ 	protected:
+ 		void onEsaiCallback(dsp56k::Audio& _audio);
+ 		void syncUcToDSP();
+@@ -93,6 +99,9 @@ namespace wLib
+ 		std::mutex m_processAudioMutex;
+ 		dsp56k::ConditionVariable m_processAudioCv;
+ 
++#ifdef GM_LOCKSTEP
++		double m_lockstepBudgetD = 0;	// uC cycles granted by ESAI frames the DSP has produced
++#endif
+ 		bool m_bootCompleted = false;
+ 		bool m_terminateUcThread = false;
+ 	};
 diff --git a/source/waldi/microq/mqLib/microq.cpp b/source/waldi/microq/mqLib/microq.cpp
-index a92a3ffc..2fb3d5b6 100644
+index a92a3ffc..62855e69 100644
 --- a/source/waldi/microq/mqLib/microq.cpp
 +++ b/source/waldi/microq/mqLib/microq.cpp
 @@ -3,7 +3,6 @@
@@ -47,7 +101,12 @@ index a92a3ffc..2fb3d5b6 100644
  #include "dsp56kBase/threadtools.h"
  
  #include "mqhardware.h"
-@@ -46,10 +45,8 @@ namespace mqLib
+@@ -42,19 +41,19 @@ namespace mqLib
+ 
+ 		m_midiOutBuffer.reserve(1024);
+ 
++#ifndef GM_LOCKSTEP
+ 		m_ucThread.reset(new std::thread([&]()
  		{
  			dsp56k::ThreadTools::setCurrentThreadPriority(dsp56k::ThreadPriority::Highest);
  			dsp56k::ThreadTools::setCurrentThreadName("MC68331");
@@ -58,6 +117,286 @@ index a92a3ffc..2fb3d5b6 100644
  				processUcThread();
  			}
  			m_destroy = false;
+ 			m_hw->ucThreadTerminated();
+ 		}));
++#endif
+ 
+ 		m_hw->getUC().getLeds().setChangeCallback([this]()
+ 		{
+@@ -80,6 +79,10 @@ namespace mqLib
+ 		if(!isValid())
+ 			return;
+ 
++#ifdef GM_LOCKSTEP
++		m_hw.reset();
++		return;
++#endif
+ 		// we need to have passed the boot stage
+ 		m_hw->processAudio(1);
+ 
+diff --git a/source/waldi/microq/mqLib/mqdsp.cpp b/source/waldi/microq/mqLib/mqdsp.cpp
+index 471db9b8..f7caadf3 100644
+--- a/source/waldi/microq/mqLib/mqdsp.cpp
++++ b/source/waldi/microq/mqLib/mqdsp.cpp
+@@ -136,6 +136,25 @@ namespace mqLib
+ 
+ 	void MqDsp::onDspBootFinished()
+ 	{
++#ifdef GM_LOCKSTEP
++		m_haveSentTXtoDSP = true;
++		setRuntimeCallbacks();
++		{
++			// never block: the caller only steps the DSP while frames are available, and drains what it makes
++			auto& esai = m_periphX.getEsai();
++			esai.setReadRxCallback([&esai](uint64_t& _frameIndex, dsp56k::Audio::RxFrame& _values)
++			{
++				auto& in = esai.getAudioInputs();
++				if (!in.empty())
++					_values = in.pop_front();
++				else
++					_values = {};
++				++_frameIndex;
++			});
++		}
++		m_lockstepRunning = true;
++		return;
++#endif
+ 		// Safety: if a thread already exists, terminate it before creating a new one.
+ 		// unique_ptr::reset(new ...) constructs the new object (starting its thread)
+ 		// BEFORE destroying the old one, which would cause two threads on the same DSP.
+@@ -165,8 +184,23 @@ namespace mqLib
+ 		m_thread->setLogToStdout(false);
+ 	}
+ 
++#ifdef GM_LOCKSTEP
++	uint64_t MqDsp::lockstepStep()
++	{
++		if (!m_lockstepRunning)
++			return 0;
++		const auto c0 = m_dsp.getCycles();
++		for (int i = 0; i < 8; ++i)
++			m_dsp.exec();
++		return m_dsp.getCycles() - c0;
++	}
++#endif
++
+ 	void MqDsp::terminateThread()
+ 	{
++#ifdef GM_LOCKSTEP
++		m_lockstepRunning = false;
++#endif
+ 		if (m_thread)
+ 		{
+ 			m_thread->terminate();
+@@ -236,8 +270,13 @@ namespace mqLib
+ 
+ 	void MqDsp::onUCRxEmpty(bool _needMoreData)
+ 	{
++#ifdef GM_LOCKSTEP
++		if (!m_lockstepRunning)
++			return;
++#else
+ 		if (!m_thread)
+ 			return;
++#endif
+ 
+ 		hdi08().injectTXInterrupt();
+ 
+@@ -306,6 +345,11 @@ namespace mqLib
+ 		m_hdiUcToDspLog[m_hdiUcToDspLogIndex % g_hdiLogSize] = _word;
+ 		++m_hdiUcToDspLogIndex;
+ 
++#ifdef GM_LOCKSTEP
++		// the DSP is the only one who can drain the RX fifo, and it only runs when somebody steps it
++		while(hdi08().rxData().full())
++			m_hardware.lockstepStepDsp();
++#endif
+ 		hdi08().writeRX(&_word, 1);
+ 	}
+ 
+@@ -322,8 +366,13 @@ namespace mqLib
+ 
+ 	void MqDsp::hdiSendIrqToDSP(uint8_t _irq)
+ 	{
++#ifdef GM_LOCKSTEP
++		if (!m_lockstepRunning)
++			return;
++#else
+ 		if (!m_thread)
+ 			return;
++#endif
+ 
+ 		const auto cmd = static_cast<HostCommand>(_irq);
+ 
+diff --git a/source/waldi/microq/mqLib/mqdsp.h b/source/waldi/microq/mqLib/mqdsp.h
+index feb042c6..b610f8c0 100644
+--- a/source/waldi/microq/mqLib/mqdsp.h
++++ b/source/waldi/microq/mqLib/mqdsp.h
+@@ -62,6 +62,10 @@ namespace mqLib
+ 		dsp56k::DSPThread& thread() { return *m_thread; }
+ 		bool haveSentTXToDSP() const { return m_haveSentTXtoDSP; }
+ 		bool hasThread() const { return m_thread != nullptr; }
++#ifdef GM_LOCKSTEP
++		bool isRunning() const { return m_lockstepRunning; }
++		uint64_t lockstepStep();	// returns DSP cycles advanced
++#endif
+ 
+ 		bool receivedMagicEsaiPacket() const { return m_receivedMagicEsaiPacket; }
+ 		void onDspBootFinished();
+@@ -96,6 +100,9 @@ namespace mqLib
+ 		uint32_t m_hdiDspToUcCount = 0;
+ 
+ 		std::unique_ptr<dsp56k::DSPThread> m_thread;
++#ifdef GM_LOCKSTEP
++		bool m_lockstepRunning = false;
++#endif
+ 
+ 		bool m_receivedMagicEsaiPacket = false;
+ 		uint32_t m_hdiTransferFailCount = 0;
+diff --git a/source/waldi/microq/mqLib/mqhardware.cpp b/source/waldi/microq/mqLib/mqhardware.cpp
+index a3d2c827..7e91a1ae 100644
+--- a/source/waldi/microq/mqLib/mqhardware.cpp
++++ b/source/waldi/microq/mqLib/mqhardware.cpp
+@@ -1,4 +1,7 @@
+ #include "mqhardware.h"
++#include <cstdio>
++#include <time.h>
++#include <cstdlib>
+ 
+ #include "synthLib/midiBufferParser.h"
+ #include "synthLib/deviceException.h"
+@@ -131,8 +134,10 @@ namespace mqLib
+ 		auto& inputs = esai.getAudioInputs();
+ 		auto& outputs = esai.getAudioOutputs();
+ 
++#ifndef GM_LOCKSTEP
+ 		while(inputs.size() > 2 && !outputs.full())
+ 			std::this_thread::yield();
++#endif
+ 
+ 		m_midiOffsetCounter = 0;
+ 	}
+@@ -335,13 +340,63 @@ namespace mqLib
+ 		});
+ 	}
+ 
++#ifdef GM_LOCKSTEP
++	bool g_lsProf = getenv("GM_LSPROF") != nullptr;
++	uint64_t g_lsProfDspNs = 0, g_lsProfUcNs = 0, g_lsProfUcCycles = 0;
++	static inline uint64_t lsNowNs() { timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return uint64_t(t.tv_sec) * 1000000000ull + t.tv_nsec; }
++	void Hardware::lockstepStepDsp()
++	{
++		auto& d = *m_dsps[0];
++		static uint32_t cntD = 0;
++		const bool sample = g_lsProf && ((++cntD & 63) == 0);
++		const uint64_t t0 = sample ? lsNowNs() : 0;
++		const auto dspCycles = d.lockstepStep();
++		if(sample) g_lsProfDspNs += (lsNowNs() - t0) * 64;
++		if(!dspCycles)
++			return;
++		// DSP time -> uC time: the ESAI clock ties both to the 44.1 kHz frame (one ESAI frame = 2 x cyclesPerSample DSP cycles = one audio sample)
++		const double dspPerSample = 2.0 * static_cast<double>(d.getPeriph().getEsaiClock().getCyclesPerSampleValue());	// the clock counts per slot, a frame has two
++		const double ucPerSample = static_cast<double>(m_uc.getSim().getSystemClockHz()) * m_samplerateInv;
++		m_lockstepBudgetD += static_cast<double>(dspCycles) * ucPerSample / dspPerSample;
++	}
++
++	void Hardware::lockstepRun(const size_t _minOutputs)
++	{
++		auto& d = *m_dsps[0];
++		auto& outs = d.getPeriph().getEsai().getAudioOutputs();
++		while(outs.size() < _minOutputs)
++		{
++			if(!d.isRunning() || m_lockstepBudgetD > 0.0)
++				processUcCycle();
++			else
++				lockstepStepDsp();
++		}
++	}
++#endif
++
+ 	void Hardware::processUcCycle()
+ 	{
++#ifndef GM_LOCKSTEP
+ 		syncUcToDSP();
++#endif
+ 
++#ifdef GM_LOCKSTEP
++		static uint32_t cntU = 0;
++		const bool sampleU = g_lsProf && ((++cntU & 63) == 0);
++		const uint64_t tuc = sampleU ? lsNowNs() : 0;
++#endif
+ 		const auto deltaCycles = m_uc.exec();
++#ifdef GM_LOCKSTEP
++		if(sampleU) g_lsProfUcNs += (lsNowNs() - tuc) * 64;
++		if(g_lsProf) g_lsProfUcCycles += deltaCycles;
++		if(m_dsps[0]->isRunning())
++			m_lockstepBudgetD -= static_cast<double>(deltaCycles);
++		else
++			m_lockstepBudgetD = 0.0;	// the uC runs free until the DSP exists; no debt to repay
++#else
+ 		if(m_esaiFrameIndex > 0)
+ 			m_remainingUcCycles -= static_cast<int64_t>(deltaCycles);
++#endif
+ 
+ 		for (size_t i = 0; i < m_dsps.size(); ++i)
+ 			m_dsps[i]->transferHostFlagsUc2Dsdp();
+@@ -407,8 +462,27 @@ namespace mqLib
+ 	{
+ 		ensureBufferSize(_frames);
+ 
++#ifdef GM_LOCKSTEP
++		if(m_esaiFrameIndex == 0)
++		{
++			// boot: nothing to output yet, just advance the machine a little (deterministic amount)
++			static uint64_t dbg = 0;
++			static const bool lsDebug = getenv("GM_LSDEBUG") != nullptr;
++			if(lsDebug && (++dbg % 2000) == 0)
++				fprintf(stderr, "ls-boot: esai=%u ucCycles=%llu dspCycles=%llu dspPC=%06x budget=%.0f running=%d\n", m_esaiFrameIndex, (unsigned long long)m_uc.getCycles(), (unsigned long long)m_dsps[0]->dsp().getCycles(), m_dsps[0]->dsp().getPC().toWord(), m_lockstepBudgetD, (int)m_dsps[0]->isRunning());
++			for(uint32_t i=0; i<256; ++i)
++			{
++				if(!m_dsps[0]->isRunning() || m_lockstepBudgetD > 0.0)
++					processUcCycle();
++				else
++					lockstepStepDsp();
++			}
++			return;
++		}
++#else
+ 		if(m_esaiFrameIndex == 0)
+ 			return;
++#endif
+ 
+ 		m_midi.process(_frames);
+ 
+@@ -502,7 +576,12 @@ namespace mqLib
+ 			{
+ 				esai.processAudioInputInterleaved(inputs, processCount, _latency);
+ 
++#ifdef GM_LOCKSTEP
++				lockstepRun(processCount);
++				const auto requiredSize = 0u;
++#else
+ 				const auto requiredSize = processCount > 8 ? processCount - 8 : 0;
++#endif
+ 
+ 				if(esai.getAudioOutputs().size() < requiredSize)
+ 				{
+diff --git a/source/waldi/microq/mqLib/mqhardware.h b/source/waldi/microq/mqLib/mqhardware.h
+index 13482377..f90b9199 100644
+--- a/source/waldi/microq/mqLib/mqhardware.h
++++ b/source/waldi/microq/mqLib/mqhardware.h
+@@ -28,6 +28,11 @@ namespace mqLib
+ 
+ 		void process();
+ 
++#ifdef GM_LOCKSTEP
++		void lockstepStepDsp() override;
++		void lockstepRun(size_t _minOutputs);
++#endif
++
+ 		MqMc& getUC() { return m_uc; }
+ 		MqDsp& getDSP(uint32_t _index = 0) { return *m_dsps[_index]; }
+ 		uint64_t getUcCycles() const { return m_uc.getCycles(); }
 diff --git a/source/waldi/xt/xtLib/xt.cpp b/source/waldi/xt/xtLib/xt.cpp
 index e2cc6700..c5f0e3ab 100644
 --- a/source/waldi/xt/xtLib/xt.cpp

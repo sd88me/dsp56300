@@ -288,6 +288,7 @@ namespace dsp56k
 		uint64_t m_execCount = 0;
 		static uint64_t execCountAll();
 		static uint64_t spinSkippedAll();
+		static DSP* firstRegistered();
 		std::vector<uint32_t> m_pcHist;
 		static void dumpHotAll(size_t _n);
 #endif

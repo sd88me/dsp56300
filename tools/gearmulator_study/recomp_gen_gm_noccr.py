@@ -1,0 +1,221 @@
+#!/usr/bin/env python3
+# Whole-program static recompiler, step 2 (gearmulator variant of recomp_gen2.py: adds the per-block DSP cycle count
+# that mQ/XT/n2x need, column 19 of the trace): turn a discovery trace into dsp56k_recomp.inl.
+#   recomp_gen2.py <disc.txt> <nm -C of the discover binary> > dsp56k_recomp.inl
+# Blocks are basic blocks over the traced code: they start at every leader (an entry point, the instruction
+# after anything that ends a block, the instruction after a DO loop end) and run until the next leader, an
+# untraced or never-recompiled instruction, a block-ending instruction (included), or MAX_INSTR.
+import sys, re
+MAX_INSTR = 64
+
+syms = {}
+for l in open(sys.argv[2]):
+    m = re.match(r'([0-9a-f]+) [tTwW] (?:void )?dsp56k::DSP::(\w+(?:<[^()]*>)?)\(unsigned int\)$', l.strip())
+    if m: syms[int(m.group(1), 16)] = m.group(2)
+
+ins, entries, loopends = {}, set(), set()
+for l in open(sys.argv[1]):
+    f = l.split()
+    if f[0] == 'I':
+        pc = int(f[1], 16)
+        ins[pc] = dict(a=int(f[2], 16), b=int(f[3], 16), len=int(f[4]), kind=int(f[5]), par=f[6] == '1',
+                       op=int(f[7], 16), mv=int(f[8], 16), alu=int(f[9], 16), count=int(f[10]),
+                       moveAB=f[11] == '1', readsPC=f[12] == '1', ccr=int(f[13]),
+                       mr=int(f[14], 16), mw=int(f[15], 16), ar=int(f[16], 16), aw=int(f[17], 16),
+                       cy=int(f[18]) if len(f) > 18 else 1)
+    elif f[0] == 'E': entries.add(int(f[1], 16))
+    elif f[0] == 'L': loopends.add(int(f[1], 16))
+
+leaders = set(entries) | {la + 1 for la in loopends}
+# Peripheral-timing correctness: HDI08 movep instructions (host handshake registers) showed a real
+# functional livelock under recompilation on Vavra (microQ) -- looping forever in a boot handshake poll
+# that the interpreter resolves in a handful of iterations. Root cause not yet isolated (ruled out:
+# block coalescing/once-per-block peripheral ticking, MAX_INSTR=1 still hangs; self-modifying code,
+# no opcode-word conflicts at these addresses). Excluding Movep from recompilation is a targeted,
+# defensible interim fix: it is cheap (a handful of executions per boot) and keeps everything else
+# recompiled. Forced back to kind=2 (interpreter-only) regardless of what discovery classified it as.
+for _pc, _i in ins.items():
+    _names = [syms.get(_i['op'], ''), syms.get(_i['alu'], ''), syms.get(_i['mv'], '')]
+    if any('Movep' in _n for _n in _names):
+        _i['kind'] = 2
+
+for pc, i in ins.items():
+    if i['kind'] != 0: leaders.add(pc + i['len'])
+
+# Dead-CCR analysis (Stage 3). A MPY/MAC-family instruction's V/Z/E/U/N results are dead when, later in the same
+# block, a KILLER (verified to overwrite all of V, Z, E, U, N on every path: see docs/ARM32_JIT.md) executes before
+# any instruction that reads the CCR, is conditional, or writes the CCR in any other way. Block ends count as reads.
+MULTIPLY = {'op_Mac_S1S2', 'op_Macr_S1S2', 'op_Mpy_S1S2D', 'op_Mpyr_S1S2D'}
+KILLERS = MULTIPLY | {'op_Add_SD', 'op_Sub_SD', 'op_Add_xx', 'op_Sub_xx', 'op_Add_xxxx', 'op_Sub_xxxx',
+                      'op_Asl_ii', 'op_Asl_D', 'op_Asr_ii', 'op_Asr_D', 'op_Cmp_S1S2', 'op_Cmp_xxS2'}
+# instructions with a dead-V/Z/E/U/N variant (UpdateCCR=false; see dsp_ops_alu.inl alu_mpyT etc.)
+DEAD_CCR_VARIANT = {n: 'op_Multiply_T' for n in MULTIPLY}
+DEAD_CCR_VARIANT.update({'op_Add_SD': 'op_Add_SD_T', 'op_Sub_SD': 'op_Sub_SD_T',
+                         'op_Asl_ii': 'op_Asl_ii_T', 'op_Asr_ii': 'op_Asr_ii_T'})
+def alu_name(i):
+    return handler(i['alu']) if i['par'] else handler(i['op'])
+def is_killer(i):
+    return False
+
+def _unused_is_killer(i):
+    n = alu_name(i)
+    return (n in KILLERS or n.startswith('opCE_Asl_D<')) and not (i['ccr'] & 0b101)
+# belt and braces: opcodeanalysis' register masks are known to be incomplete (see reorderable below), so anything
+# whose handler name says it may read or rewrite the CCR is a barrier even when its masks and flags say otherwise
+CCR_BARRIER_NAMES = ('Movec', 'Tcc', 'Bcc', 'Jcc', 'BScc', 'JScc', 'Ifcc', 'ADC', 'Adc', 'Sbc', 'SBC', 'Div', 'Norm',
+                     'Andi', 'Ori', 'Rep', 'Do', 'Jclr', 'Jset', 'Brclr', 'Brset', 'Jsclr', 'Jsset', 'Bsclr', 'Bsset')
+def names_of(i):
+    return [handler(i['alu']), handler(i['mv'])] if i['par'] else [handler(i['op'])]
+def ccr_barrier(i):
+    return i['ccr'] or any(b in n for n in names_of(i) for b in CCR_BARRIER_NAMES)
+def ccr_dead(pcs, k):
+    for pc in pcs[k + 1:]:
+        j = ins[pc]
+        if is_killer(j) and not ccr_barrier_by_move(j): return True
+        if ccr_barrier(j): return False
+    return False
+def ccr_barrier_by_move(i):
+    return i['par'] and any(b in handler(i['mv']) for b in CCR_BARRIER_NAMES)
+dead_ccr = 0
+
+# Parallel ALU+move without the latch: exec_parallel runs the ALU, then the move with A/B restored to their pre-ALU
+# values. Running the move FIRST is identical when the move only STORES (register -> memory, W=0): it then writes only
+# memory and address registers, which no parallel ALU op reads, and any register it reads is either untouched by the
+# ALU or the ALU's destination accumulator, which it must see pre-ALU anyway. (A move's limiter may set the sticky L
+# bit, which commutes with the ALU's own L |= V.) Direction comes from the opcode, NOT from opcodeanalysis' register
+# masks: those miss some MAC/MPY source registers (e.g. report no X/Y reads), and trusting them broke 10 machines.
+def reorderable(i):
+    mv = handler(i['mv'])
+    if mv == 'op_Movel_ea': return not (i['a'] >> 15) & 1
+    if mv.startswith(('opCE_Movex_ea<0u,', 'opCE_Movey_ea<0u,', 'opCE_Movexy<0u, 0u,')): return True
+    return False
+
+# a block can also be emitted as a whole-loop function when it ends exactly at an observed DO loop end, contains only
+# plain (kind 0) instructions, and nothing whose name suggests it could touch loop/stack/mode state (register masks are
+# unreliable, see reorderable)
+LOOP_UNSAFE = ('Enddo', 'Movec', 'Do', 'Rep', 'Jsr', 'Bsr', 'Rts', 'Rti', 'Jmp', 'Bra', 'Jcc', 'Bcc', 'JScc', 'BScc',
+               'Jclr', 'Jset', 'Brclr', 'Brset', 'Jsclr', 'Jsset', 'Bsclr', 'Bsset', 'Andi', 'Ori', 'Illegal', 'Stop',
+               'Wait', 'Reset', 'Trap', 'Ifcc', 'Tcc', 'Lra', 'Plock', 'Punlock', 'Pfree', 'Pflush')
+loop_blocks = set()
+def loop_body_ok(pcs):
+    last = pcs[-1]
+    if last + ins[last]['len'] - 1 not in loopends: return False
+    for pc in pcs:
+        i = ins[pc]
+        if i['kind'] != 0 or i['readsPC']: return False
+        if any(u in n for n in names_of(i) for u in LOOP_UNSAFE): return False
+    return True
+
+def handler(off):
+    if off not in syms: raise KeyError(f'no symbol for handler offset {off:x}')
+    return syms[off]
+
+blocks = []
+for start in sorted(leaders):
+    if start not in ins or ins[start]['kind'] == 2: continue
+    pcs, pc = [], start
+    while pc in ins and ins[pc]['kind'] != 2 and len(pcs) < MAX_INSTR:
+        if pcs and pc in leaders: break
+        pcs.append(pc)
+        if ins[pc]['kind'] == 1: break
+        pc += ins[pc]['len']
+    blocks.append(pcs)
+
+out = ['// generated by recomp_gen2.py from a mnm-recomp-discover trace -- do not edit', '']
+total_instr = 0
+for pcs in blocks:
+    start = pcs[0]
+    nwords = pcs[-1] + ins[pcs[-1]]['len'] - start
+    words = []
+    for pc in pcs:
+        i = ins[pc]; words.append(i['a'])
+        if i['len'] == 2: words.append(i['b'])
+    out.append(f'static constexpr TWord g_recompWords_{start:06x}[] = {{{", ".join(f"0x{w:06x}" for w in words)}}};')
+    body = []
+    for n, pc in enumerate(pcs):
+        i = ins[pc]; op = f'0x{i["a"]:06x}u'
+        h = handler(i['op']) if not i['par'] else ''
+        alu = alu_name(i)
+        if alu in DEAD_CCR_VARIANT and not ccr_barrier_by_move(i) and not (i['ccr'] & 0b101) and ccr_dead(pcs, n):
+            dead_ccr += i['count']
+            alu = DEAD_CCR_VARIANT[alu] + '<false>'
+            if not i['par']: h = alu
+        # PC bookkeeping only where a handler reads it: control flow (kind 1, always a block's last
+        # instruction), anything that reads PC, LRA/STOP. The block's final PC is written once at its end.
+        if i['kind'] == 1 or i['readsPC'] or h.startswith(('op_Lra', 'op_Stop')):
+            body.append(f'\td->pcCurrentInstruction = 0x{pc:06x}; d->reg.pc.var = 0x{pc + 1:06x};')
+        if i['len'] == 2:
+            body.append(f'\td->m_opWordB = 0x{i["b"]:06x}u;')
+        if i['par'] and i['moveAB'] and reorderable(i):
+            body += [f'\td->{handler(i["mv"])}({op});', f'\td->{alu}({op});']
+        elif i['par'] and i['moveAB']:
+            # the move reads/writes A or B: reproduce exec_parallel's latch (move sees pre-ALU A/B)
+            body += ['\t{', '\t\tconst auto preA = d->reg.a, preB = d->reg.b;', f'\t\td->{alu}({op});',
+                    '\t\tconst auto postA = d->reg.a, postB = d->reg.b;', '\t\td->reg.a = preA; d->reg.b = preB;',
+                    f'\t\td->{handler(i["mv"])}({op});', '\t\tif (postA != preA) d->reg.a = postA;',
+                    '\t\tif (postB != preB) d->reg.b = postB;', '\t}']
+        elif i['par']:
+            # the move doesn't touch A or B, so ALU-then-move is exactly what the latch would produce
+            body += [f'\td->{alu}({op});', f'\td->{handler(i["mv"])}({op});']
+        else:
+            body.append(f'\td->{h}({op});')
+    last = pcs[-1]; end = last + ins[last]['len']
+    out.append(f'template<> __attribute__((flatten)) bool DSP::recompBlock<0x{start:06x}>(DSP* d) noexcept')
+    out.append('{')
+    out += body
+    out.append(f'\td->m_instructions += {len(pcs)};')   # once per block, like the JIT
+    out += ['#ifdef DSP56K_INTERP_CYCLES', f'\td->m_cycles += {sum(ins[pc]["cy"] for pc in pcs)};', '#endif']
+    if ins[last]['kind'] != 1:
+        out.append(f'\td->pcCurrentInstruction = 0x{last:06x}; d->reg.pc.var = 0x{end:06x};')
+    out += ['\treturn true;', '}', '']
+    if loop_body_ok(pcs):
+        # the whole DO loop in one call: do_exec's per-iteration logic (pc == la+1 is guaranteed: plain instructions
+        # only, the block ends at LA), without the dispatch in between -- like the JIT's in-block loop
+        loop_blocks.add(start)
+        out.append(f'template<> __attribute__((flatten)) bool DSP::recompLoop<0x{start:06x}>(DSP* d) noexcept')
+        out += ['{', '\tfor(;;)', '\t{']
+        out += ['\t' + l for l in body]
+        out.append(f'\t\td->m_instructions += {len(pcs)};')
+        out += ['#ifdef DSP56K_INTERP_CYCLES', f'\t\td->m_cycles += {sum(ins[pc]["cy"] for pc in pcs)};', '#endif']
+        out.append(f'\t\tif(!(d->reg.sr.var & SR_LF)) {{ d->pcCurrentInstruction = 0x{last:06x}; d->reg.pc.var = 0x{end:06x}; return true; }}')
+        out.append(f'\t\tif(d->reg.lc.var <= 1) {{ d->pcCurrentInstruction = 0x{last:06x}; d->setPC(0x{end:06x}); d->do_end(); return true; }}')
+        out.append('\t\t--d->reg.lc.var;')
+        out += ['\t}', '}', '']
+    blocks_words = nwords
+    total_instr += len(pcs)
+
+starts = [b[0] for b in blocks]
+base, top = min(starts), max(b[-1] for b in blocks)
+maxw = max(b[-1] + ins[b[-1]]['len'] - b[0] for b in blocks)
+out.append('const DSP::RecompProgram* DSP::recompProgram()')
+out.append('{')
+out.append('\tstatic const RecompBlock blocks[] = {')
+out.append('\t\t{nullptr, nullptr, 0, 0, nullptr},')
+for b in blocks:
+    nw = b[-1] + ins[b[-1]]['len'] - b[0]
+    lf = f'&DSP::recompLoop<0x{b[0]:06x}>' if b[0] in loop_blocks else 'nullptr'
+    out.append(f'\t\t{{&DSP::recompBlock<0x{b[0]:06x}>, g_recompWords_{b[0]:06x}, 0x{b[0]:06x}, {nw}, {lf}}},')
+out.append('\t};')
+out.append('\tstatic const std::vector<uint16_t> index = [] {')
+out.append(f'\t\tstd::vector<uint16_t> v(0x{top - base + 1:x} + {maxw}, 0);   // + maxw: covered[] shares this size')
+out.append('\t\tfor (size_t i = 1; i < sizeof(blocks) / sizeof(blocks[0]); ++i)')
+out.append(f'\t\t\tv[blocks[i].pc - 0x{base:06x}] = static_cast<uint16_t>(i);')
+out.append('\t\treturn v;')
+out.append('\t}();')
+out.append('\tstatic const std::vector<uint8_t> covered = [] {')
+out.append(f'\t\tstd::vector<uint8_t> v(0x{top - base + 1:x} + {maxw}, 0);')
+out.append('\t\tfor (size_t i = 1; i < sizeof(blocks) / sizeof(blocks[0]); ++i)')
+out.append('\t\t\tfor (TWord w = 0; w < blocks[i].numWords; ++w)')
+out.append(f'\t\t\t\tv[blocks[i].pc - 0x{base:06x} + w] = 1;')
+out.append('\t\treturn v;')
+out.append('\t}();')
+out.append(f'\tstatic const RecompProgram program{{blocks, sizeof(blocks) / sizeof(blocks[0]), index.data(), covered.data(), TWord(index.size()), 0x{base:06x}, {maxw}}};')
+out.append('\treturn &program;')
+out.append('}')
+assert len(blocks) < 65535
+print('\n'.join(out))
+covered = sum(ins[pc]['count'] for b in blocks for pc in b)
+alln = sum(i['count'] for i in ins.values())
+sys.stderr.write(f'{len(blocks)} blocks, {total_instr} instructions, avg {total_instr/len(blocks):.1f}/block, '
+                 f'max {maxw} words; covers {100*covered/alln:.2f}% of executed instructions; '
+                 f'dead-CCR ALU ops {100*dead_ccr/alln:.2f}% of executed instructions; {len(loop_blocks)} whole-loop blocks\n')
