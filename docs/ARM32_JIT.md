@@ -820,3 +820,55 @@ of `recomp_gen2.py`, adds the DSP-cycle column and the Movep exclusion), `gm_pro
 recompiled DSP instances side by side from identical state, diff full registers after every instruction, not
 just instruction counts) to find the exact first point of divergence, rather than continuing to guess-and-check
 whole mechanisms.
+
+## Vavra recompiler: the hang is fixed (2026-09-27, later still)
+
+**Root cause found via a differential comparator (per-instruction pc/a/b/sr trace, x86 interpreter vs
+recompiled, diffed index-for-index -- built for this, see `tools/gearmulator_study/gm_probe.cpp`'s
+`GM_REGTRACE`/`GM_REGTRACE_CAP`).** First divergence was at instruction #4,117,125: the interpreter goes
+`P:$013b1 -> $013b3` (a 2-word `BRCLR #n,S,label` self-poll branch, correctly consuming its label
+extension word); the recompiled build goes `$013b1 -> $013b2`, treating the label word as a separate,
+wrong instruction.
+
+**The bug was in the discovery tool, not the DSP core or the recompiler's code generation.** Its opcode
+decode (`Opcodes::getInstructionTypes`/`findNonParallelOpcodeInfo`) uses a per-instance table
+(`m_opcodesNonParallel`) built by the `Opcodes()` constructor from `hasField()` checks; discovery used a
+namespace-scope global `Opcodes g_ops;`, constructed at static-init time (before `main()`), while the DSP's
+own copy is a member constructed later, after the ROM loads. For this ambiguous bit pattern (0x0cc300,
+which superficially also matches `Add_SD`'s near-fully-wildcarded encoding), the global's construction
+raced/preceded something the field tables depend on and picked the wrong candidate, silently. The real DSP's
+own copy of the same table (built after full program init) always resolved it correctly, which is why the
+disassembler and every live-executing build got this right and only the discovery-time re-decode got it
+wrong. Fix: made the `Opcodes` instance a function-local (lazily-constructed) singleton
+(`Opcodes& ops() { static Opcodes instance; return instance; }`), guaranteeing it isn't built before
+whatever it depends on. One-line fix; `tools/gearmulator_study/gm_probe.cpp`.
+
+**Result after fixing and regenerating the trace + `.inl`: the recompiled + lock-step build completes.**
+No more hang, on x86 or the Force. Deterministic (same hash across repeated runs). mnm-bench-style timing:
+x86 0.60-0.66x real time (faster than real time); Force (pinned, taskset -c 3) 4.75x real time -- an
+improvement on the interpreter's 6.55x but not yet real-time on-device, expected since a nontrivial share
+of Vavra's boot/handshake code (2-word branches like the one above) is correctly excluded from
+recompilation (`kind=2`, interpreter fallback) and this trace hasn't had the Stage-3-style optimisation
+pass Monomodule got.
+
+**Not yet bit-exact: a second, different divergence remains, further into execution.** Re-running the same
+differential comparator (now index-1,000,000+ before it recurs) finds the SAME instruction (`BRCLR` self-poll,
+this time at $013dc, correctly classified `kind=2`/interpreter-only after the fix) where the interpreter's
+poll condition resolves (branches out to $013de) while the recompiled build's identical interpreter-dispatch
+call for the same instruction keeps looping. Since kind=2 means this exact instruction runs through the
+plain interpreter in both builds, the difference isn't in decoding it -- it's that the *peripheral state it
+polls* differs, meaning the uC/DSP lock-step scheduling has drifted by this point. Leading suspect: the
+per-block `DSP56K_INTERP_CYCLES` cycle summation (added for this synth, not part of the Monomodule-proven
+pipeline) accumulating a small error over millions of blocks, enough to shift when
+`Hardware::lockstepRun`'s uC/DSP turn-taking (driven by DSP cycle count) hands control to the uC relative to
+real interpreter timing. Not yet confirmed or fixed -- worth its own differential trace pass (log the uC's
+own cycle count alongside DSP pc/regs) before touching the cycle math.
+
+Housekeeping: `tools/gearmulator_study/recomp_gen_gm.py` now includes the fixed length column) and the
+Movep-exclusion no longer matters (superseded by the real fix, kept anyway as a defensive default). New
+files: `recomp_gen_gm_max1.py`/`_max1_noloop.py` (diagnostic MAX_INSTR=1 variants, useful for future
+differential work), `gm_probe.cpp`'s `GM_REGTRACE`/`GM_REGTRACE_CAP`/`GM_LSDEBUG` are now permanent tools,
+not one-off hacks.
+
+Sent to the user: a 10s render from this fixed recompiled build, and one from the plain interpreter for
+comparison (same script). Both complete; correctness between them is not yet proven bit-exact per above.

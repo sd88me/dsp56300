@@ -53,11 +53,11 @@ uint64_t g_conflicts = 0;
 std::map<TWord, uint64_t> g_conflictPcs;
 std::set<TWord> g_entries, g_loopEnds;
 TWord g_expectedNext = 0xffffffff;
-Opcodes g_ops;
+Opcodes& ops() { static Opcodes instance; return instance; }	// lazy: avoid static-init-order issues with a namespace-scope global
 TWord lengthAt(DSP* d, TWord pc) {
 	const TWord a = d->memory().get(MemArea_P, pc);
 	Instruction ia = Nop, ib = Invalid;
-	if (a) g_ops.getInstructionTypes(a, ia, ib);
+	if (a) ops().getInstructionTypes(a, ia, ib);
 	const auto len = Opcodes::getOpcodeLength(a, ia, ib);
 	return len ? len : 1;
 }
@@ -78,8 +78,17 @@ void write(const char* path) {
 	for (const auto& [pc, n] : g_runCount) {
 		const TWord a = d.memory().get(MemArea_P, pc), b = d.memory().get(MemArea_P, pc + 1);	// final contents, consistent with the resolved handlers
 		Instruction ia = Nop, ib = Invalid;
-		if (a) g_ops.getInstructionTypes(a, ia, ib);
+		if (a) ops().getInstructionTypes(a, ia, ib);
 		const TWord len = Opcodes::getOpcodeLength(a, ia, ib);
+		if (pc == 0x0013b1) {
+			fprintf(stderr, "DEBUG pc=0013b1 a=%06x b=%06x ia=%d ib=%d len=%u isNonParallel(word)=%d\n", a, b, (int)ia, (int)ib, len, (int)Opcodes::isNonParallelOpcode(a));
+			for (size_t k = 0; k < 400; ++k) {
+				const OpcodeInfo& oik = Opcodes::getOpcodeInfoAt(k);
+				const auto mk = oik.m_mask1 | oik.m_mask0;
+				if ((a & mk) == oik.m_mask1)
+					fprintf(stderr, "  DEBUG raw match inst=%zu mask0=%06x mask1=%06x\n", k, oik.m_mask0, oik.m_mask1);
+			}
+		}
 		const auto ri = d.getRecompInfo(pc);
 		const auto flags = Opcodes::getFlags(ia, ib);
 		RegisterMask written = RegisterMask::None, read = RegisterMask::None;
@@ -122,6 +131,27 @@ void write(const char* path) {
 }
 }
 #endif
+
+#ifdef DSP56K_RECOMP_DISCOVERY
+// Differential comparator: log a compact per-instruction register trace so two builds (interpreter vs
+// recompiled) can be diffed index-for-index to find the exact first point of divergence. Independent of
+// GM_DISCOVER (the block-building harness) -- this just needs the trace hook, which fires once per real
+// instruction as long as blocks are MAX_INSTR=1 on the recompiled side (see recomp_gen_gm.py).
+namespace regtrace {
+FILE* g_file = nullptr;
+uint64_t g_count = 0, g_cap = 0;
+#pragma pack(push, 1)
+struct Rec { uint32_t pc; uint64_t a; uint64_t b; uint32_t sr; };
+#pragma pack(pop)
+void hook(dsp56k::DSP* d, dsp56k::TWord pc) {
+	if (g_count >= g_cap) { std::fclose(g_file); fprintf(stderr, "regtrace: cap reached, wrote %llu records\n", (unsigned long long)g_count); _exit(0); }
+	Rec r{pc, d->regs().a.var, d->regs().b.var, d->regs().sr.var};
+	std::fwrite(&r, sizeof(r), 1, g_file);
+	++g_count;
+	if ((g_count & 0xffff) == 0) std::fflush(g_file);	// survives a kill -9 if the workload never naturally ends
+}
+}
+#endif
 using namespace synthLib;
 using clk = std::chrono::steady_clock;
 
@@ -138,6 +168,13 @@ int main(int argc, char** argv)
 	dsp56k::DSP::s_recompTraceHook = &disc::hook;
 #endif
 	if (!getenv("GM_LOG")) Logging::setLogFunc([](const std::string&) {});	// this device's LOG() macro is unconditional and dominates runtime otherwise
+#ifdef DSP56K_RECOMP_DISCOVERY
+	if (const char* rt = getenv("GM_REGTRACE")) {
+		regtrace::g_file = std::fopen(rt, "wb");
+		regtrace::g_cap = getenv("GM_REGTRACE_CAP") ? strtoull(getenv("GM_REGTRACE_CAP"), nullptr, 10) : 3000000ull;
+		dsp56k::DSP::s_recompTraceHook = &regtrace::hook;
+	}
+#endif
 	RomLoader::setSearchPath(dir);
 	DeviceCreateParams p;
 #if defined(GM_SYNTH_VIRUS)
@@ -265,6 +302,9 @@ int main(int argc, char** argv)
 	printf("spin_skipped=%llu\n", (unsigned long long)dsp56k::DSP::spinSkippedAll());
 #ifdef GM_DISCOVER
 	if (getenv("GM_TRACE")) disc::write(getenv("GM_TRACE"));
+#endif
+#ifdef DSP56K_RECOMP_DISCOVERY
+	if (regtrace::g_file) { std::fclose(regtrace::g_file); fprintf(stderr, "regtrace: wrote %llu records\n", (unsigned long long)regtrace::g_count); }
 #endif
 	if (getenv("GM_HOT")) dsp56k::DSP::dumpHotAll(static_cast<size_t>(atoi(getenv("GM_HOT"))));
 	if (dump) fclose(dump);

@@ -135,7 +135,7 @@ index a92a3ffc..62855e69 100644
  		m_hw->processAudio(1);
  
 diff --git a/source/waldi/microq/mqLib/mqdsp.cpp b/source/waldi/microq/mqLib/mqdsp.cpp
-index 471db9b8..f7caadf3 100644
+index 471db9b8..382c20c9 100644
 --- a/source/waldi/microq/mqLib/mqdsp.cpp
 +++ b/source/waldi/microq/mqLib/mqdsp.cpp
 @@ -136,6 +136,25 @@ namespace mqLib
@@ -164,7 +164,7 @@ index 471db9b8..f7caadf3 100644
  		// Safety: if a thread already exists, terminate it before creating a new one.
  		// unique_ptr::reset(new ...) constructs the new object (starting its thread)
  		// BEFORE destroying the old one, which would cause two threads on the same DSP.
-@@ -165,8 +184,23 @@ namespace mqLib
+@@ -165,8 +184,25 @@ namespace mqLib
  		m_thread->setLogToStdout(false);
  	}
  
@@ -173,9 +173,11 @@ index 471db9b8..f7caadf3 100644
 +	{
 +		if (!m_lockstepRunning)
 +			return 0;
++		// One exec() call per step, not a fixed batch: with DSP56K_RECOMP a single exec() can run a whole
++		// block (many real instructions), so batching would let the DSP run far past HDI08 round-trips
++		// the uC needs to service in between, overflowing its own TX/RX and livelocking the boot handshake.
 +		const auto c0 = m_dsp.getCycles();
-+		for (int i = 0; i < 8; ++i)
-+			m_dsp.exec();
++		m_dsp.exec();
 +		return m_dsp.getCycles() - c0;
 +	}
 +#endif
@@ -188,7 +190,7 @@ index 471db9b8..f7caadf3 100644
  		if (m_thread)
  		{
  			m_thread->terminate();
-@@ -236,8 +270,13 @@ namespace mqLib
+@@ -236,8 +272,13 @@ namespace mqLib
  
  	void MqDsp::onUCRxEmpty(bool _needMoreData)
  	{
@@ -202,7 +204,7 @@ index 471db9b8..f7caadf3 100644
  
  		hdi08().injectTXInterrupt();
  
-@@ -306,6 +345,11 @@ namespace mqLib
+@@ -306,6 +347,11 @@ namespace mqLib
  		m_hdiUcToDspLog[m_hdiUcToDspLogIndex % g_hdiLogSize] = _word;
  		++m_hdiUcToDspLogIndex;
  
@@ -214,7 +216,7 @@ index 471db9b8..f7caadf3 100644
  		hdi08().writeRX(&_word, 1);
  	}
  
-@@ -322,8 +366,13 @@ namespace mqLib
+@@ -322,8 +368,13 @@ namespace mqLib
  
  	void MqDsp::hdiSendIrqToDSP(uint8_t _irq)
  	{
@@ -254,7 +256,7 @@ index feb042c6..b610f8c0 100644
  		bool m_receivedMagicEsaiPacket = false;
  		uint32_t m_hdiTransferFailCount = 0;
 diff --git a/source/waldi/microq/mqLib/mqhardware.cpp b/source/waldi/microq/mqLib/mqhardware.cpp
-index a3d2c827..7e91a1ae 100644
+index a3d2c827..ab11f15a 100644
 --- a/source/waldi/microq/mqLib/mqhardware.cpp
 +++ b/source/waldi/microq/mqLib/mqhardware.cpp
 @@ -1,4 +1,7 @@
@@ -276,7 +278,7 @@ index a3d2c827..7e91a1ae 100644
  
  		m_midiOffsetCounter = 0;
  	}
-@@ -335,13 +340,63 @@ namespace mqLib
+@@ -335,13 +340,68 @@ namespace mqLib
  		});
  	}
  
@@ -304,8 +306,13 @@ index a3d2c827..7e91a1ae 100644
 +	{
 +		auto& d = *m_dsps[0];
 +		auto& outs = d.getPeriph().getEsai().getAudioOutputs();
++		static const bool dbg = getenv("GM_LSDEBUG2") != nullptr;
++		uint64_t n = 0;
 +		while(outs.size() < _minOutputs)
 +		{
++			if(dbg && ((++n) % 2000000) == 0)
++				fprintf(stderr, "lockstepRun stuck: running=%d budget=%.1f outs=%zu need=%zu dspPC=%06x ucPC=%x resetPending=%d\n",
++					(int)d.isRunning(), m_lockstepBudgetD, outs.size(), _minOutputs, d.dsp().getPC().toWord(), m_uc.getPC(), (int)m_dspResetPending);
 +			if(!d.isRunning() || m_lockstepBudgetD > 0.0)
 +				processUcCycle();
 +			else
@@ -340,7 +347,7 @@ index a3d2c827..7e91a1ae 100644
  
  		for (size_t i = 0; i < m_dsps.size(); ++i)
  			m_dsps[i]->transferHostFlagsUc2Dsdp();
-@@ -407,8 +462,27 @@ namespace mqLib
+@@ -407,8 +467,31 @@ namespace mqLib
  	{
  		ensureBufferSize(_frames);
  
@@ -350,8 +357,12 @@ index a3d2c827..7e91a1ae 100644
 +			// boot: nothing to output yet, just advance the machine a little (deterministic amount)
 +			static uint64_t dbg = 0;
 +			static const bool lsDebug = getenv("GM_LSDEBUG") != nullptr;
++			static bool sawBoot2 = false;
++			static uint32_t lastResetCount = 0;
 +			if(lsDebug && (++dbg % 2000) == 0)
-+				fprintf(stderr, "ls-boot: esai=%u ucCycles=%llu dspCycles=%llu dspPC=%06x budget=%.0f running=%d\n", m_esaiFrameIndex, (unsigned long long)m_uc.getCycles(), (unsigned long long)m_dsps[0]->dsp().getCycles(), m_dsps[0]->dsp().getPC().toWord(), m_lockstepBudgetD, (int)m_dsps[0]->isRunning());
++				fprintf(stderr, "ls-boot: esai=%u ucCycles=%llu dspCycles=%llu dspPC=%06x budget=%.0f running=%d bootDone=%d resets=%u\n", m_esaiFrameIndex, (unsigned long long)m_uc.getCycles(), (unsigned long long)m_dsps[0]->dsp().getCycles(), m_dsps[0]->dsp().getPC().toWord(), m_lockstepBudgetD, (int)m_dsps[0]->isRunning(), (int)m_bootCompleted, m_veResetCount);
++			if(lsDebug && m_bootCompleted && !sawBoot2) { sawBoot2 = true; fprintf(stderr, "BOOT COMPLETED at dbg=%llu\n", (unsigned long long)dbg); }
++			if(lsDebug && m_veResetCount != lastResetCount) { fprintf(stderr, "RESET COUNT CHANGED %u -> %u at dbg=%llu\n", lastResetCount, m_veResetCount, (unsigned long long)dbg); lastResetCount = m_veResetCount; }
 +			for(uint32_t i=0; i<256; ++i)
 +			{
 +				if(!m_dsps[0]->isRunning() || m_lockstepBudgetD > 0.0)
@@ -368,7 +379,7 @@ index a3d2c827..7e91a1ae 100644
  
  		m_midi.process(_frames);
  
-@@ -502,7 +576,12 @@ namespace mqLib
+@@ -502,7 +585,12 @@ namespace mqLib
  			{
  				esai.processAudioInputInterleaved(inputs, processCount, _latency);
  

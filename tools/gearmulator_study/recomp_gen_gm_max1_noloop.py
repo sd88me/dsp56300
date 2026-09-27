@@ -27,18 +27,6 @@ for l in open(sys.argv[1]):
     elif f[0] == 'L': loopends.add(int(f[1], 16))
 
 leaders = set(entries) | {la + 1 for la in loopends}
-# Peripheral-timing correctness: HDI08 movep instructions (host handshake registers) showed a real
-# functional livelock under recompilation on Vavra (microQ) -- looping forever in a boot handshake poll
-# that the interpreter resolves in a handful of iterations. Root cause not yet isolated (ruled out:
-# block coalescing/once-per-block peripheral ticking, MAX_INSTR=1 still hangs; self-modifying code,
-# no opcode-word conflicts at these addresses). Excluding Movep from recompilation is a targeted,
-# defensible interim fix: it is cheap (a handful of executions per boot) and keeps everything else
-# recompiled. Forced back to kind=2 (interpreter-only) regardless of what discovery classified it as.
-for _pc, _i in ins.items():
-    _names = [syms.get(_i['op'], ''), syms.get(_i['alu'], ''), syms.get(_i['mv'], '')]
-    if any('Movep' in _n for _n in _names):
-        _i['kind'] = 2
-
 for pc, i in ins.items():
     if i['kind'] != 0: leaders.add(pc + i['len'])
 
@@ -165,7 +153,7 @@ for pcs in blocks:
     if ins[last]['kind'] != 1:
         out.append(f'\td->pcCurrentInstruction = 0x{last:06x}; d->reg.pc.var = 0x{end:06x};')
     out += ['\treturn true;', '}', '']
-    if loop_body_ok(pcs):
+    if False and loop_body_ok(pcs):
         # the whole DO loop in one call: do_exec's per-iteration logic (pc == la+1 is guaranteed: plain instructions
         # only, the block ends at LA), without the dispatch in between -- like the JIT's in-block loop
         loop_blocks.add(start)
