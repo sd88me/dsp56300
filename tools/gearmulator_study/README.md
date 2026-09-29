@@ -73,10 +73,22 @@ differential comparator -- also already fixed for a tracer blind spot found alon
    subroutine at `$25b` as already-done); the recompiled build finds it *clear* (runs that subroutine, which
    itself sets the bit at completion, before rejoining the same PC). Confirmed genuine data divergence: both
    converge to PC `$3220` but with different `a` register contents.
-8. **Not yet found: why `Y:$6` bit 0 itself differs earlier.** `Y:$6` is a "this setup already ran" flag --
-   next step is finding every write to it (the `bset` at `$1ce`, plus whatever clears bit 0 elsewhere, likely
-   once per output block/MIDI tick) and diffing those between builds with the same `GM_TCSR2LOG`-style
-   pattern. Full writeup in `docs/ARM32_JIT.md`, "The actual fork point, found" section.
+8. **Done: refined the interpretation, ruled out interrupt-timing.** Checked whether an ISR at `$80`-`$84`
+   (the only other write near `Y:$6`) explains it -- zero occurrences near the fork point in either build,
+   ruled out. Re-read `func_00025b` (the subroutine `Y:$6` bit 0 gates): it's **not** one-time setup -- it
+   walks a data table via `(r0)+` and dispatches on flag bits, the shape of "process the next queued item"
+   (likely pending MIDI/parameter events). So `Y:$6` bit 0 is more likely a per-pass "serviced" latch.
+9. **Current best understanding:** this is very likely a genuine **event-scheduling timing variance** --
+   when a queued item gets serviced relative to other DSP work -- rather than a wrong-computation bug in any
+   single opcode. An interpreter and a block-batched recompiler can each be locally correct while servicing
+   an async/queued event a few instructions earlier or later than the other, after which real state
+   legitimately diverges. **Next steps, in order of effort:** (a) find what's actually queued/processed at
+   the fork (inspect the data `r0` points to) to judge real audible impact -- a slightly-early/late parameter
+   update is very different from a wrong sample; (b) if it matters, the fix is architectural (match
+   event-service granularity to the interpreter's), not a small local patch; (c) if it doesn't matter
+   audibly -- plausible, since the first 730 samples matched perfectly and this is boot-adjacent, not the
+   hot path -- the recompiler may already be usable despite this known, now well-understood gap. Full
+   writeup in `docs/ARM32_JIT.md`.
 3. Once bit-exact (or a second real bug is found and fixed), re-measure Force timing (last measured: 4.75x
    real time, worse than the interpreter's own eventual target of 100%; a proper Stage-3-style optimisation
    pass, never done for this synth, is likely needed before it's usable in the port).
