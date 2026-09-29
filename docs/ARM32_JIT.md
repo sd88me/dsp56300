@@ -1121,3 +1121,55 @@ sample #730's timeframe (cycle ~319.8-320M) has a nested DO loop, and if so whet
 opcode, if it contains one at all -- `recomp_gen_gm.py`'s leader/block-boundary rules may already exclude DO
 instructions from being fused into an enclosing loop body, in which case this hypothesis is wrong and the
 `GM_TCSR2LOG`-style direct SR_LF-write logger is the more reliable next step regardless).
+
+## The actual fork point, found (2026-09-30, later still)
+
+**Ruled out the nested-DO-loop hypothesis directly.** `loop_body_ok()` in `recomp_gen_gm.py` already excludes
+`Do` (among other unsafe opcodes) from ever being fused into a `recompLoop` body -- a nested loop just isn't
+eligible for the whole-loop optimization in the first place, so it can't be a reimplementation bug there.
+
+**Added `GM_LFLOG`** (env-gated, `dsp.cpp`, kept permanently): logs every `do_exec()`/`do_end()` call with
+PC, loop-end address, stack count (`sc`), `SR_LF`, cycles and instruction counter. Ran both builds for 1 audio
+second (942,198 vs 942,225 loop events -- close but not identical, confirming *something* eventually
+diverges) and diffed the sequences structurally (loop nesting depth, PCs, `SR_LF` transitions, ignoring the
+already-known-incomparable `instr` field). **Result: the two builds match in perfect lock-step for 410,135
+consecutive loop entry/exit events** -- an enormous, reassuring amount of correctly-matched history -- **then
+at the very next `do_exec`, they enter completely different loops** (`$0003ce` vs `$0002c3`). The last shared
+event is `do_end` at PC `$0001ad` (the tail of `recompLoop<0x0001a8>`, a small 16-iteration DO loop), cycles
+~319,549,090 (int) / ~319,548,555 (rc) -- a much more precise target than the earlier sample-730 estimate.
+
+**Captured a tight per-instruction ring right at that cycle** (`GM_REGTRACE_CYCLESTOP=319560000`,
+`GM_REGTRACE_RINGSIZE=20000`, using the `GM_LFLOG` binaries which already have `DSP56K_RECOMP_DISCOVERY`).
+Locating the specific occurrence of PC `$01ae` (the loop's exit target) nearest the known cycle, then reading
+forward: **int's real per-instruction PC sequence is `...457, 465, 3220...`; rc's per-block sequence is
+`...457, 459, 603, 628, 633, 656, 682, 686, ..., 759, 462, 463, 465, 3220...`** -- both eventually reach PC
+3220, but **with different `a` register contents there** (`71972656764682240` vs `72057594021150720`) --
+confirmed genuine data divergence, not a block-granularity logging artifact.
+
+**Disassembled the fork point exactly**: `$0001c9: brset #$0,y:$6,func_0001d1` -- tests bit 0 of `Y:$6`.
+- **int** finds it *set*: jumps straight to `$0001d1` (`jsr func_000c94`).
+- **rc** finds it *clear*: falls through to `$0001cb`, sets up `r0`, calls `jsr func_00025b` (a whole
+  subroutine -- exactly matching rc's observed detour through `$25b`-`$759`), which does real work (clears
+  `a`, several moves) and, near its end, itself executes `bset #$0,y:$6` -- **setting the very bit that gates
+  this branch** -- before falling through and rejoining at `$0001d1`, the same place int jumped to directly.
+
+**Interpretation: `Y:$6` bit 0 is a "this setup already ran" flag.** One build believes it's already been
+done (skips the subroutine); the other doesn't (runs it, then marks it done). Both converge back to the same
+PC (`$1d1`) but with genuinely different register state, because one build executed real extra code
+(`func_00025b`) the other legitimately skipped as already-done. This is the actual root of the divergence
+found across three sessions now -- not a DO-loop/SR_LF bug (that was a downstream symptom: the two builds'
+subsequent control flow differs enough, after this fork, that they eventually enter different loops too),
+not a Timer2/TCSR2 bug (that was a red herring from mis-correlating trace granularities), not a 68k-timing
+bug (also a downstream symptom).
+
+**Not yet found: why `Y:$6` bit 0 differs at this point** -- i.e., what sets/clears it *earlier*, and why
+that happens at a different relative time (in real DSP terms) between the two builds. Given `func_00025b`
+itself sets the bit at completion, and the bit is presumably cleared somewhere at a natural reset point (once
+per output block/MIDI tick, most likely, since this pattern -- run setup once, mark done, skip on subsequent
+checks until next reset -- is a classic "do this once per period" idiom), **the next step is to find every
+write to `Y:$6`** (both the `bset` at `$1ce` and whatever clears bit 0 elsewhere -- likely a `bclr #$0,y:$6`
+or a full `move #0,y:$6` near a block/frame boundary) and log those with the same `GM_TCSR2LOG`-style
+env-gated diagnostic, diffed between builds. The mechanism is almost certainly the same family of "recompiled
+dispatch processes a different number of something-per-real-time-unit than the interpreter" that's come up
+repeatedly, but this time it's pinned to a specific, checkable memory location rather than a vague timing
+theory.

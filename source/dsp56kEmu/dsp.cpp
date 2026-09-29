@@ -5,6 +5,7 @@
 #include <iomanip>
 #include <mutex>
 #include <cstdio>
+#include <cstdlib>
 #include <vector>
 #include <algorithm>
 #include <cstring>
@@ -551,9 +552,21 @@ namespace dsp56k
 	// _____________________________________________________________________________
 	// exec_do
 	//
+#ifdef GM_LFLOG
+	static void lflogPrint(const char* _where, TWord _pc, TWord _addr, uint32_t _sc, bool _lf, uint64_t _cycles, uint64_t _instr)
+	{
+		static const bool on = getenv("GM_LFLOG") != nullptr;
+		if (!on) return;
+		fprintf(stderr, "LF %s: pc=%06x addr=%06x sc=%u lf=%d cycles=%llu instr=%llu\n", _where,
+			_pc, _addr, _sc, (int)_lf, (unsigned long long)_cycles, (unsigned long long)_instr);
+	}
+#endif
 	bool DSP::do_exec( TWord _loopcount, TWord _addr )
 	{
 	//	LOG( "DO BEGIN: " << (int)sc.var << ", loop flag = " << sr_test(SR_LF) );
+#ifdef GM_LFLOG
+		lflogPrint("do_exec/enter", pcCurrentInstruction, _addr, reg.sc.var, (reg.sr.var & SR_LF) != 0, getCycles(), getInstructionCounter());
+#endif
 
 		if( !_loopcount )
 		{
@@ -622,6 +635,9 @@ namespace dsp56k
 	//
 	bool DSP::do_end()
 	{
+#ifdef GM_LFLOG
+		lflogPrint("do_end/enter", pcCurrentInstruction, 0, reg.sc.var, (reg.sr.var & SR_LF) != 0, getCycles(), getInstructionCounter());
+#endif
 		// restore previous loop flag
 		sr_toggle( SR_LF, (ssl().var & SR_LF) != 0 );
 
@@ -632,7 +648,9 @@ namespace dsp56k
 		reg.la = ssh();
 
 	//	LOG( "DO END: loop flag = " << sr_test(SR_LF) << " sc=" << (int)sc.var << " lc:" << std::hex << lc.var << " la:" << std::hex << la.var );
-
+#ifdef GM_LFLOG
+		lflogPrint("do_end/exit", pcCurrentInstruction, 0, reg.sc.var, (reg.sr.var & SR_LF) != 0, getCycles(), getInstructionCounter());
+#endif
 		return true;
 	}
 
