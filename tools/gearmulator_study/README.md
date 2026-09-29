@@ -52,11 +52,24 @@ differential comparator -- also already fixed for a tracer blind spot found alon
    differently on identical state.
 4. **The bug is still real, confirmed independent of tracing:** a plain 20-audio-second render gives
    different hashes (interpreter `df13dfba3901a669` vs recompiled `c793b429768eb629`).
-5. **Next concrete step:** stop trying to align per-instruction traces across builds with different natural
-   granularities (block vs instruction). Instead **bisect on the audio output directly** -- compare
-   sample-by-sample (not just a whole-run hash) between builds to find the first differing sample, then
-   correlate its timestamp back to a DSP cycle/instruction count via the ESAI clock math to find the
-   surrounding code region. This sidesteps the block-vs-instruction mismatch entirely.
+5. **Done (2026-09-30, later still): bisected on audio output, found it (probably).** The two builds first
+   differ at output sample #730 (16.5ms into a render, not instruction 13-16M as the earlier
+   block-granularity-confounded trace suggested). `execCountAll()` isn't comparable between builds (36.8M vs
+   7.0M instructions at the identical point!) -- use `getCycles()` instead, the real shared clock. Added
+   `GM_REGTRACE_CYCLESTOP`/`GM_REGTRACE_RINGSIZE` (ring-buffer dump once cycles cross a target, avoids
+   needing a 150M+ record trace to skip past boot). Nearest-cycle matching is hazardous in a tight repetitive
+   polling loop (aliases different loop phases), but consistently found, at two independent points, `sr`
+   differing between builds by exactly `0x8000` = **`SR_LF`, the DO-loop-active flag**. This matters because
+   `DSP::execRecompiled()` branches on this exact bit.
+6. **Checked the generated `recompLoop` bodies directly:** loop-exit correctly delegates to the shared
+   `do_end()` (not a reimplementation), and loop-entry's `sr_set(SR_LF)` happens in the shared `do_exec()`
+   before calling `execRecompiledLoop()` -- single-loop handling looks architecturally sound.
+7. **Next concrete step:** the leading hypothesis is a *nested* DO loop inside a recompiled loop body's
+   fused block not correctly re-entering `do_exec()`'s stack bookkeeping for the inner loop. Check whether
+   this ROM has a nested DO loop near cycle ~319.8-320M and whether it's fused into an enclosing
+   `recompLoop` block in the `.inl`. If that's wrong, fall back to a direct `SR_LF`-write logger (same
+   pattern as `GM_TCSR2LOG`) diffed between builds around that cycle range. Full writeup in
+   `docs/ARM32_JIT.md`, "Found it (probably)..." section.
 3. Once bit-exact (or a second real bug is found and fixed), re-measure Force timing (last measured: 4.75x
    real time, worse than the interpreter's own eventual target of 100%; a proper Stage-3-style optimisation
    pass, never done for this synth, is likely needed before it's usable in the port).
