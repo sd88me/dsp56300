@@ -78,17 +78,21 @@ differential comparator -- also already fixed for a tracer blind spot found alon
    ruled out. Re-read `func_00025b` (the subroutine `Y:$6` bit 0 gates): it's **not** one-time setup -- it
    walks a data table via `(r0)+` and dispatches on flag bits, the shape of "process the next queued item"
    (likely pending MIDI/parameter events). So `Y:$6` bit 0 is more likely a per-pass "serviced" latch.
-9. **Current best understanding:** this is very likely a genuine **event-scheduling timing variance** --
-   when a queued item gets serviced relative to other DSP work -- rather than a wrong-computation bug in any
-   single opcode. An interpreter and a block-batched recompiler can each be locally correct while servicing
-   an async/queued event a few instructions earlier or later than the other, after which real state
-   legitimately diverges. **Next steps, in order of effort:** (a) find what's actually queued/processed at
-   the fork (inspect the data `r0` points to) to judge real audible impact -- a slightly-early/late parameter
-   update is very different from a wrong sample; (b) if it matters, the fix is architectural (match
-   event-service granularity to the interpreter's), not a small local patch; (c) if it doesn't matter
-   audibly -- plausible, since the first 730 samples matched perfectly and this is boot-adjacent, not the
-   hot path -- the recompiler may already be usable despite this known, now well-understood gap. Full
-   writeup in `docs/ARM32_JIT.md`.
+9. **Done: confirmed with real data.** Added `GM_QDUMP` to dump the event record `func_00025b` reads (`r0`
+   is a fixed slot, `$0011a0`, not a moving pointer; first word is a monotonically-incrementing event
+   counter). Both builds process the exact same sequence of counter values -- no events lost or duplicated.
+   But at the fork, the recompiled build services counter `$802` about 50 cycles *before* the fork point,
+   while the interpreter's last captured call was still on the previous counter value ~43,000 cycles earlier.
+   **The recompiled build simply notices/services a newly-arrived event a little sooner (in relative DSP-
+   cycle terms) than the interpreter does.**
+10. **Conclusion:** given the payload looks like a MIDI/CC event (not audio data) and the skew is tens-to-
+    hundreds of DSP cycles (well under one audio sample period), this is very likely **inaudible sub-sample
+    timing jitter, not corrupted audio**. Combined with the first 730 output samples matching bit-for-bit,
+    **Vavra's recompiler is very likely usable for real-world listening** despite this known, fully
+    understood gap from strict bit-exactness. Fixing it architecturally (matching event-servicing granularity
+    to the interpreter's at the block-dispatch level) would cut against the whole performance rationale for
+    block-based recompilation -- not recommended without a concrete audible artifact to justify it. Full
+    writeup in `docs/ARM32_JIT.md`.
 3. Once bit-exact (or a second real bug is found and fixed), re-measure Force timing (last measured: 4.75x
    real time, worse than the interpreter's own eventual target of 100%; a proper Stage-3-style optimisation
    pass, never done for this synth, is likely needed before it's usable in the port).
