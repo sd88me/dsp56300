@@ -17,6 +17,8 @@
 #include "synthLib/romLoader.h"
 #include "baseLib/logging.h"
 #include "dsp56kEmu/dsp.h"
+#include "dsp56kEmu/disasm.h"
+#include "dsp56kEmu/opcodes.h"
 #include "mc68k/mc68k.h"
 
 #if defined(GM_SYNTH_VIRUS)
@@ -319,6 +321,30 @@ int main(int argc, char** argv)
 	if (regtrace::g_file) { std::fclose(regtrace::g_file); fprintf(stderr, "regtrace: wrote %llu records\n", (unsigned long long)regtrace::g_count); }
 #endif
 	if (getenv("GM_HOT")) dsp56k::DSP::dumpHotAll(static_cast<size_t>(atoi(getenv("GM_HOT"))));
+	if (const char* da = getenv("GM_DISASM")) {
+		// one-off diagnostic: disassemble a window of P memory around a given address, using the ROM's
+		// final, resolved contents at process end (after boot has downloaded the real program).
+		uint32_t center = strtoul(da, nullptr, 16);
+		uint32_t before = getenv("GM_DISASM_BEFORE") ? strtoul(getenv("GM_DISASM_BEFORE"), nullptr, 10) : 10;
+		uint32_t after  = getenv("GM_DISASM_AFTER")  ? strtoul(getenv("GM_DISASM_AFTER"), nullptr, 10) : 10;
+		auto* d = dsp56k::DSP::firstRegistered();
+		if (d) {
+			dsp56k::Opcodes opcodes;
+			dsp56k::Disassembler disasm(opcodes);
+			uint32_t pc = center > before ? center - before : 0;
+			const uint32_t end = center + after;
+			while (pc <= end) {
+				const dsp56k::TWord a = d->memory().get(dsp56k::MemArea_P, pc);
+				const dsp56k::TWord b = d->memory().get(dsp56k::MemArea_P, pc + 1);
+				std::string text;
+				const uint32_t len = disasm.disassemble(text, a, b, d->regs().sr.var, d->regs().omr.var, pc);
+				printf("%s%06x: %06x %06x  %s\n", pc == center ? "-> " : "   ", pc, a, b, text.c_str());
+				pc += len ? len : 1;
+			}
+		} else {
+			fprintf(stderr, "GM_DISASM: no registered DSP instance\n");
+		}
+	}
 	if (dump) fclose(dump);
 	fflush(stdout);
 	_exit(0);	// destructors can hang on a DSP that never reaches WAIT (interpreter build)

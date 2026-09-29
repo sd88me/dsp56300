@@ -4,8 +4,26 @@
 
 #include "timers.h"
 
+#ifdef GM_TCSR2LOG
+#include <cstdio>
+#include <cstdlib>
+#endif
+
 namespace dsp56k
 {
+#ifdef GM_TCSR2LOG
+	// gearmulator study, one-off diagnostic: log every observed change to Timer2's TCSR (x:$ffff87),
+	// tagged with the DSP's PC and instruction counter at the moment it's observed -- used to find whether
+	// the interpreter and recompiled builds tick/observe this register at different points relative to the
+	// surrounding instruction stream. See docs/ARM32_JIT.md, "uC side instrumented..." section.
+	static void logTcsr2(const IPeripherals& _p, uint32_t _val, const char* _where)
+	{
+		static const bool on = getenv("GM_TCSR2LOG") != nullptr;
+		if (!on) return;
+		auto& dsp = _p.getDSP();
+		fprintf(stderr, "TCSR2 %s: val=%06x pc=%06x instr=%llu\n", _where, _val, dsp.getPC().toWord(), (unsigned long long)dsp.getInstructionCounter());
+	}
+#endif
 	uint32_t Timers::exec() noexcept
 	{
 		// Prescaler Counter
@@ -45,6 +63,9 @@ namespace dsp56k
 		if (!_t.m_tcsr.test(Timer::M_TE))
 			return;
 
+#ifdef GM_TCSR2LOG
+		const auto before = static_cast<uint32_t>(_t.m_tcsr);
+#endif
 		_t.m_tcr += _cycles;
 
 		if (_t.m_tcr > 0xffffff)
@@ -74,6 +95,10 @@ namespace dsp56k
 			if(mode(_index) != ModePWM && _t.m_tcsr.test(Timer::M_TRM))
 				_t.m_tcr = _t.m_tlr + overshoot;
 		}
+#ifdef GM_TCSR2LOG
+		if (_index == 2 && static_cast<uint32_t>(_t.m_tcsr) != before)
+			logTcsr2(m_peripherals, static_cast<uint32_t>(_t.m_tcsr), "execTimer(hw)");
+#endif
 	}
 
 	void Timers::writeTCSR(int _index, TWord _val)
@@ -108,6 +133,10 @@ namespace dsp56k
 		timerFlagReset<Timer::M_TCF>(t.m_tcsr, _val);
 
 		t.m_tcsr = _val;
+#ifdef GM_TCSR2LOG
+		if (_index == 2)
+			logTcsr2(m_peripherals, _val, "writeTCSR(sw)");
+#endif
 	}
 
 	void Timers::writeTLR(int _index, TWord _val)

@@ -990,3 +990,61 @@ New file: `tools/gearmulator_study/diff_uc3.py` (the mmap/generator differential
 pass -- memory-safe for 100M+-record traces, unlike a naive list-based version). Trace files themselves
 (`trace_int2.bin`, `trace_rc3.bin`, ~4.8GB each) are not committed -- kept on real disk at
 `/home/sam/scratch-gm/`, regenerable via the build+run steps in `README.md`.
+
+## Identified the polled register, ruled out a data-corruption theory, and found a methodology caveat (2026-09-30, later)
+
+**Identified the exact instruction and register.** Added a one-off `GM_DISASM=<hex pc>` diagnostic to
+`gm_probe.cpp` (uses `dsp56k::Disassembler` against the live DSP's P: memory after boot; kept, it's generally
+useful). $0001db is `jset #$15,x:<<$ffff87,func_0001e4` -- a poll on bit 15 of **Timer2's TCSR**
+(`$FFFF87` = `M_TCSR2` in `timers.h`). Bit 15 is `M_PCE` (Prescaled Clock Enable), a plain software-driven
+control bit, not an automatic hardware status flag -- so the initial theory was a data-write bug (something
+upstream writing the wrong value), not a timing artifact. A full-P-memory disassembly scan found every
+reference to `$ffff87`: a `CLR B` + `MOVEP B,X:$FFFF87` pair at $0001d1-$0001d5, six instructions before the
+poll, plus a couple of `BSET #$0` (setting `M_TE`, timer enable) elsewhere.
+
+**Added `GM_TCSR2LOG`, a tiny env-gated diagnostic in `timers.cpp`** that logs every observed change to
+Timer2's TCSR (both software writes via `writeTCSR()` and hardware-driven changes via `execTimer()`), tagged
+with PC and the DSP's instruction counter. Ran both builds for 8 audio seconds spanning the previously-found
+divergence point (regenerated the discovery trace + `.inl` from scratch this session, since `/tmp` had been
+wiped by a host restart -- see "Housekeeping" below). **Result: the write VALUES and total event COUNT are
+identical between builds (57,923 events each, same alternating `val=000001`/`val=300000` sequence, same
+order)** -- this rules out a data-corruption/wrong-value-written theory for this specific register. Zero
+`execTimer(hw)` events ever fired in this window (Timer2's `M_TE` gets set then cleared again within ~10-12K
+instructions each cycle, too short to reach its own overflow/compare thresholds) -- so Timer2 is being used
+here as a software-toggled flag, not a real hardware timer, and its own internal ticking logic isn't in play
+for this specific register at this point in the program.
+
+**However: the logged PC differs between builds for the exact same logical write event** (`pc=00012f` vs
+`pc=00012a`, a constant 5-word offset, for what's otherwise the identical `BSET #$0` write) **and instruction
+counts jitter by up to ~16 either side of the interpreter's**. This, plus revisiting the previous divergence
+mechanics, points to a **methodology caveat in the differential trace itself**: the recompiled build's
+`s_recompTraceHook` fires once per *fused block* (`recomp_gen_gm.py`'s blocks average 3.1 real instructions
+each for this ROM), stamped with the block's *starting* PC, while the interpreter's fires once per real
+instruction. Matching trace records by raw `dspInstr` counter value (as `diff_uc3.py` and the previous
+session's analysis did) does not guarantee comparing the same real moment -- a recompiled block's one trace
+record can represent several real instructions' worth of state change collapsed into one entry. The earlier
+"DSP MISMATCH at dspInstr 13,179,646: int PC=$1e6 vs rc PC=$1db" finding is very plausibly this artifact
+(the interpreter genuinely at $1e6 after several more branches; the recompiled build's *block-start* PC still
+reading $1db while its block has actually progressed further internally) rather than proof of one instruction
+branching differently on identical state.
+
+**The bug is still real, though -- confirmed directly at the audio level, independent of any tracing
+methodology.** Running both builds for a plain 20-audio-second render (no discovery/trace overhead) gives
+different hashes: interpreter `df13dfba3901a669`, recompiled `c793b429768eb629`. So there is a genuine
+functional divergence somewhere in this run; it just isn't yet pinned to a single instruction the way the
+$0001db lead seemed to promise.
+
+**Next step, revised:** stop trying to line up per-instruction traces across builds with different natural
+granularities. Instead, bisect on the *audio output* directly (which needs no instruction-level
+instrumentation and is granularity-agnostic): run both builds for progressively shorter durations / compare
+sample-by-sample (not just a whole-run hash) to find the first audio sample that differs, then correlate that
+sample's timestamp back to a DSP cycle count / instruction count via the existing per-cycle ESAI clock math to
+find the surrounding code region. This sidesteps the block-vs-instruction trace mismatch entirely.
+
+**Housekeeping:** the scratchpad (`/tmp`, tmpfs) was wiped by a host VM restart between sessions -- rebuilt
+the gearmulator checkout, reapplied the fork + `gearmulator-glue.patch`, and discovered the `git apply` had
+silently no-op'd on `source/cpu/mc68k` (a nested submodule) despite reporting "Applied patch...cleanly" --
+had to reapply the `Mc68k::s_traceHook` edit by hand. Worth remembering if `gearmulator-glue.patch` is ever
+reapplied fresh again. The `GM_DISASM` env var (disassemble a P: memory window around a given PC after boot)
+and `GM_TCSR2LOG` (log Timer2 TCSR changes) are both kept in `gm_probe.cpp`/`timers.cpp` as permanent,
+env-gated diagnostics -- zero cost unless the env var is set.
