@@ -64,12 +64,19 @@ differential comparator -- also already fixed for a tracer blind spot found alon
 6. **Checked the generated `recompLoop` bodies directly:** loop-exit correctly delegates to the shared
    `do_end()` (not a reimplementation), and loop-entry's `sr_set(SR_LF)` happens in the shared `do_exec()`
    before calling `execRecompiledLoop()` -- single-loop handling looks architecturally sound.
-7. **Next concrete step:** the leading hypothesis is a *nested* DO loop inside a recompiled loop body's
-   fused block not correctly re-entering `do_exec()`'s stack bookkeeping for the inner loop. Check whether
-   this ROM has a nested DO loop near cycle ~319.8-320M and whether it's fused into an enclosing
-   `recompLoop` block in the `.inl`. If that's wrong, fall back to a direct `SR_LF`-write logger (same
-   pattern as `GM_TCSR2LOG`) diffed between builds around that cycle range. Full writeup in
-   `docs/ARM32_JIT.md`, "Found it (probably)..." section.
+7. **Done (2026-09-30, later still): found the actual fork point.** Ruled out the nested-DO-loop hypothesis
+   directly (`loop_body_ok()` already excludes `Do` from `recompLoop` fusion). Added `GM_LFLOG` (logs every
+   `do_exec()`/`do_end()` call) and found the two builds match in perfect lock-step for **410,135 consecutive
+   loop entry/exit events**, then diverge. Traced forward with a new `GM_REGTRACE_CYCLESTOP`/
+   `GM_REGTRACE_RINGSIZE` mechanism (cheap cycle-targeted ring-buffer trace) to the exact instruction: at
+   `$0001c9` (`brset #$0,y:$6,func_0001d1`), the interpreter finds `Y:$6` bit 0 *set* (skips a whole
+   subroutine at `$25b` as already-done); the recompiled build finds it *clear* (runs that subroutine, which
+   itself sets the bit at completion, before rejoining the same PC). Confirmed genuine data divergence: both
+   converge to PC `$3220` but with different `a` register contents.
+8. **Not yet found: why `Y:$6` bit 0 itself differs earlier.** `Y:$6` is a "this setup already ran" flag --
+   next step is finding every write to it (the `bset` at `$1ce`, plus whatever clears bit 0 elsewhere, likely
+   once per output block/MIDI tick) and diffing those between builds with the same `GM_TCSR2LOG`-style
+   pattern. Full writeup in `docs/ARM32_JIT.md`, "The actual fork point, found" section.
 3. Once bit-exact (or a second real bug is found and fixed), re-measure Force timing (last measured: 4.75x
    real time, worse than the interpreter's own eventual target of 100%; a proper Stage-3-style optimisation
    pass, never done for this synth, is likely needed before it's usable in the port).
