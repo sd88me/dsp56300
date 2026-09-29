@@ -1048,3 +1048,76 @@ had to reapply the `Mc68k::s_traceHook` edit by hand. Worth remembering if `gear
 reapplied fresh again. The `GM_DISASM` env var (disassemble a P: memory window around a given PC after boot)
 and `GM_TCSR2LOG` (log Timer2 TCSR changes) are both kept in `gm_probe.cpp`/`timers.cpp` as permanent,
 env-gated diagnostics -- zero cost unless the env var is set.
+
+## Found it (probably): the divergence is at sample #730, and it's the DO-loop flag (2026-09-30, later still)
+
+**Bisected on raw audio output instead of instruction traces** -- exactly the plan from the previous section,
+and it worked immediately. Dumped both builds' interleaved-float PCM output (`gm_probe`'s existing
+`dump.raw` argument) for a 20s render and compared sample-for-sample: **the two builds first differ at
+output sample #730 (16.5ms into the render, audio block 11 of 64-sample blocks)** -- not at instruction
+13-16M as the earlier (block-granularity-confounded) instruction trace suggested. Confirmed it's a genuine
+value difference, not a latency/phase offset: no sample shift in a +/-5 window brings the streams back into
+agreement.
+
+**Correlating this to DSP state needed a new tool.** `execCountAll()` (the interpreter instruction counter
+used for progress logging) is *not* comparable between builds -- it read ~36.8M for the interpreter vs ~7.0M
+for the recompiled build at the exact same point (their loop-fusion/spin-skip accounting differs, apparently
+substantially, though final audio was still identical up to sample 730 despite this). `getCycles()` (the
+actual DSP hardware clock), by contrast, matches almost exactly between builds at every block boundary --
+it's the only reliable common ground-truth clock. Sample #730 corresponds to roughly cycle 319,780,000-
+319,952,000.
+
+**Added `GM_REGTRACE_CYCLESTOP`/`GM_REGTRACE_RINGSIZE`** to `gm_probe.cpp`'s regtrace writer: instead of a
+flat record-count cap (which would need ~150M+ records just to reach cycle 320M, most of it wasted boot-phase
+history), it keeps a ring buffer of only the most recent N records and dumps it once the DSP's cycle count
+crosses a target -- gives "the last N instructions leading up to cycle X" in a small file regardless of how
+long boot took to get there. Kept permanently, zero cost unless `GM_REGTRACE_CYCLESTOP` is set.
+
+**First attempt at matching records by nearest absolute cycle value ran into a real aliasing hazard**: the
+code in this region is a tight, highly repetitive polling loop, so many records share nearby/identical cycle
+values across very different loop iterations, and naive nearest-cycle matching can compare two different
+*phases* of the same repeating loop rather than the same real moment -- worth remembering before trying this
+match strategy again. Despite that caveat, the mismatch found this way was strikingly consistent: at two
+different, widely-separated sample points in the ring, the interpreter and recompiled builds' `sr` (status
+register) values differed by **exactly one bit, `0x8000`, which is `SR_LF` (`registers.h`) -- the DSP's DO-loop-
+active flag.** Confirmed twice independently (same exact XOR both times), with `a`/`b` accumulators matching.
+
+**This is a strong, mechanistically well-supported lead, not yet confirmed as the root cause.** `SR_LF` isn't
+cosmetic: `DSP::execRecompiled()` (`dsp.h`) has `if((reg.sr.var & SR_LF) && TWord(reg.la.var - _pc) <
+b.numWords - 1) return false;` -- i.e. whether a given PC dispatches via the fast recompiled path or falls
+back to the interpreter *depends on this exact bit*. If the two builds disagree about whether a DO loop is
+currently active, they can take different dispatch paths for the identical PC, which would very plausibly
+cascade into the kind of small, hard-to-pin-down divergence chased across two sessions now.
+
+**Next concrete step:** find where/why `SR_LF` ends up disagreeing -- likely somewhere in the DO/ENDDO
+instruction handling or `do_exec()`'s own loop-entry/exit bookkeeping, specifically whichever code path
+sets/clears `SR_LF` and whether the recompiled dispatch's loop-entry (`execRecompiledLoop`) or loop-exit
+(inside `do_exec()`) keeps it in sync with the interpreter's own DO/ENDDO handling in every case. A direct,
+tractable next diagnostic: log every write to `SR_LF` (both set and clear, with PC and cycle) the same way
+`GM_TCSR2LOG` did for the timer register, and diff that between builds around cycle 319.8-320M.
+
+**Checked the generated `recompLoop` bodies in `recomp-mq/dsp56k_recomp.inl` directly** (regenerated this
+session -- the discovery trace and `.inl` don't survive a `/tmp` wipe, see Housekeeping above): the loop-exit
+tail is faithful to `do_exec()`'s own logic and correctly delegates to the *shared* `d->do_end()` (not a
+reimplementation) --
+```cpp
+if(!(d->reg.sr.var & SR_LF)) { ...; d->reg.pc.var = <after>; return true; }
+if(d->reg.lc.var <= 1) { ...; d->setPC(<after>); d->do_end(); return true; }
+```
+matching `do_exec()`'s `if(!sr_test_noCache(SR_LF)) break;` / `do_end()` pair exactly, and the loop-entry
+`sr_set(SR_LF)` + `ssl(reg.lc)` push happens in the *shared* `do_exec()` before it ever calls
+`execRecompiledLoop()` (`dsp.cpp` line ~579, before line 589) -- so single, non-nested DO loops look
+architecturally sound in both paths; this isn't an obvious reimplementation bug.
+
+**Leading hypothesis, not yet confirmed:** a *nested* DO loop -- if a `DO` instruction is encountered from
+*inside* a recompiled loop body's fused block, does the generated code correctly re-enter `do_exec()`'s
+stack-based push/pop bookkeeping the way the interpreter naturally would by just executing the `DO` opcode
+through the normal interpreter dispatch? If the code generator's fused loop body doesn't handle an inner `DO`
+by genuinely calling `do_exec()` again (recursing properly, preserving the outer loop's saved `SR_LF`/`LC`/`LA`
+on the software stack), a nested loop scenario would be exactly the kind of rare, hard-to-trigger case that
+surfaces ~16ms into a run rather than immediately at boot. Next session: find whether this ROM's code near
+sample #730's timeframe (cycle ~319.8-320M) has a nested DO loop, and if so whether it's inside one of the
+`recompLoop` blocks in the `.inl` (check that block's generated body for how it handles an embedded `Do_xxx`
+opcode, if it contains one at all -- `recomp_gen_gm.py`'s leader/block-boundary rules may already exclude DO
+instructions from being fused into an enclosing loop body, in which case this hypothesis is wrong and the
+`GM_TCSR2LOG`-style direct SR_LF-write logger is the more reliable next step regardless).

@@ -149,16 +149,44 @@ uint64_t g_count = 0, g_cap = 0;
 // this is what's needed to catch a scheduling/ordering divergence that leaves each side's own counters intact.
 struct Rec { uint8_t kind; uint8_t pad[7]; uint32_t pc; uint64_t a; uint64_t b; uint32_t sr; uint64_t cycles; uint64_t instr; };
 #pragma pack(pop)
+// GM_REGTRACE_CYCLESTOP: instead of a flat record-count cap (which can require a huge file just to reach a
+// target far past a long boot phase), keep only the most recent GM_REGTRACE_RINGSIZE records in a ring buffer
+// and dump it once the DSP's cycle count reaches the target -- gives a small file of "the N instructions
+// leading up to cycle X" regardless of how many billions of cycles it took to get there.
+uint64_t g_cycleStop = 0;
+std::vector<Rec> g_ring;
+uint64_t g_ringPos = 0, g_ringFilled = 0;
+void dumpRingAndExit() {
+	const uint64_t n = g_ringFilled < g_ring.size() ? g_ringFilled : g_ring.size();
+	const uint64_t start = g_ringFilled < g_ring.size() ? 0 : g_ringPos;
+	for (uint64_t i = 0; i < n; ++i)
+		std::fwrite(&g_ring[(start + i) % g_ring.size()], sizeof(Rec), 1, g_file);
+	std::fclose(g_file);
+	fprintf(stderr, "regtrace: cyclestop reached, wrote %llu ring records\n", (unsigned long long)n);
+	_exit(0);
+}
 void hookDsp(dsp56k::DSP* d, dsp56k::TWord pc) {
-	if (g_count >= g_cap) { std::fclose(g_file); fprintf(stderr, "regtrace: cap reached, wrote %llu records\n", (unsigned long long)g_count); _exit(0); }
 	Rec r{}; r.kind = 0; r.pc = pc; r.a = d->regs().a.var; r.b = d->regs().b.var; r.sr = d->regs().sr.var; r.cycles = d->getCycles(); r.instr = d->getInstructionCounter();
+	if (g_cycleStop) {
+		g_ring[g_ringPos % g_ring.size()] = r;
+		++g_ringPos; ++g_ringFilled;
+		if (r.cycles >= g_cycleStop) dumpRingAndExit();
+		return;
+	}
+	if (g_count >= g_cap) { std::fclose(g_file); fprintf(stderr, "regtrace: cap reached, wrote %llu records\n", (unsigned long long)g_count); _exit(0); }
 	std::fwrite(&r, sizeof(r), 1, g_file);
 	++g_count;
 	if ((g_count & 0xffff) == 0) std::fflush(g_file);	// survives a kill -9 if the workload never naturally ends
 }
 void hookUc(mc68k::Mc68k* u, uint32_t pc, uint64_t cycles) {
-	if (g_count >= g_cap) { std::fclose(g_file); fprintf(stderr, "regtrace: cap reached, wrote %llu records\n", (unsigned long long)g_count); _exit(0); }
 	Rec r{}; r.kind = 1; r.pc = pc; r.cycles = cycles;
+	if (g_cycleStop) {
+		g_ring[g_ringPos % g_ring.size()] = r;
+		++g_ringPos; ++g_ringFilled;
+		if (r.cycles >= g_cycleStop) dumpRingAndExit();
+		return;
+	}
+	if (g_count >= g_cap) { std::fclose(g_file); fprintf(stderr, "regtrace: cap reached, wrote %llu records\n", (unsigned long long)g_count); _exit(0); }
 	std::fwrite(&r, sizeof(r), 1, g_file);
 	++g_count;
 	if ((g_count & 0xffff) == 0) std::fflush(g_file);
@@ -185,6 +213,11 @@ int main(int argc, char** argv)
 	if (const char* rt = getenv("GM_REGTRACE")) {
 		regtrace::g_file = std::fopen(rt, "wb");
 		regtrace::g_cap = getenv("GM_REGTRACE_CAP") ? strtoull(getenv("GM_REGTRACE_CAP"), nullptr, 10) : 3000000ull;
+		if (const char* cs = getenv("GM_REGTRACE_CYCLESTOP")) {
+			regtrace::g_cycleStop = strtoull(cs, nullptr, 10);
+			const uint64_t ringSize = getenv("GM_REGTRACE_RINGSIZE") ? strtoull(getenv("GM_REGTRACE_RINGSIZE"), nullptr, 10) : 200000ull;
+			regtrace::g_ring.resize(ringSize);
+		}
 		dsp56k::DSP::s_recompTraceHook = &regtrace::hookDsp;
 		if (getenv("GM_REGTRACE_UC")) mc68k::Mc68k::s_traceHook = &regtrace::hookUc;
 	}
@@ -281,6 +314,10 @@ int main(int argc, char** argv)
 		dev->process(ins, outs, block, midiIn, midiOut);
 		if (getenv("GM_PROGRESS") && (b & 0x3ff) == 0)
 			fprintf(stderr, "progress: block=%llu/%llu instr=%llu\n", (unsigned long long)b, (unsigned long long)blocks, (unsigned long long)dsp56k::DSP::execCountAll());
+		if (getenv("GM_SAMPLELOG") && b < static_cast<uint64_t>(atoi(getenv("GM_SAMPLELOG"))))
+			fprintf(stderr, "sampleblock b=%llu sample0=%llu instr=%llu cycles=%llu\n",
+				(unsigned long long)b, (unsigned long long)(b * block), (unsigned long long)dsp56k::DSP::execCountAll(),
+				(unsigned long long)(dsp56k::DSP::firstRegistered() ? dsp56k::DSP::firstRegistered()->getCycles() : 0));
 		for (size_t s = 0; s < block; ++s)
 			for (uint32_t c = 0; c < nOut && c < 12; ++c)
 			{
@@ -318,6 +355,7 @@ int main(int argc, char** argv)
 	if (getenv("GM_TRACE")) disc::write(getenv("GM_TRACE"));
 #endif
 #ifdef DSP56K_RECOMP_DISCOVERY
+	if (regtrace::g_file && regtrace::g_cycleStop) regtrace::dumpRingAndExit();	// never reached cycleStop naturally -- dump what we have
 	if (regtrace::g_file) { std::fclose(regtrace::g_file); fprintf(stderr, "regtrace: wrote %llu records\n", (unsigned long long)regtrace::g_count); }
 #endif
 	if (getenv("GM_HOT")) dsp56k::DSP::dumpHotAll(static_cast<size_t>(atoi(getenv("GM_HOT"))));
