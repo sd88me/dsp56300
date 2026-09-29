@@ -1162,14 +1162,41 @@ subsequent control flow differs enough, after this fork, that they eventually en
 not a Timer2/TCSR2 bug (that was a red herring from mis-correlating trace granularities), not a 68k-timing
 bug (also a downstream symptom).
 
-**Not yet found: why `Y:$6` bit 0 differs at this point** -- i.e., what sets/clears it *earlier*, and why
-that happens at a different relative time (in real DSP terms) between the two builds. Given `func_00025b`
-itself sets the bit at completion, and the bit is presumably cleared somewhere at a natural reset point (once
-per output block/MIDI tick, most likely, since this pattern -- run setup once, mark done, skip on subsequent
-checks until next reset -- is a classic "do this once per period" idiom), **the next step is to find every
-write to `Y:$6`** (both the `bset` at `$1ce` and whatever clears bit 0 elsewhere -- likely a `bclr #$0,y:$6`
-or a full `move #0,y:$6` near a block/frame boundary) and log those with the same `GM_TCSR2LOG`-style
-env-gated diagnostic, diffed between builds. The mechanism is almost certainly the same family of "recompiled
-dispatch processes a different number of something-per-real-time-unit than the interpreter" that's come up
-repeatedly, but this time it's pinned to a specific, checkable memory location rather than a vague timing
-theory.
+**Not yet found: why `Y:$6` bit 0 differs at this point.** Two theories checked, one ruled out:
+
+- *Interrupt-timing theory (ruled out for this occurrence):* the only non-`bset` write to `Y:$6` found in the
+  disassembled range is `move n6,y:$6` at `$000083`, which sits in the DSP's exception-vector address range
+  (`$00`-~`$100`) -- looked like it could be an ISR whose firing point (only checked once per
+  `execInterpreter()`/block call, via `m_interruptFunc`, same granularity concern as `execPeriph()`) could
+  shift relative to surrounding code between interpreted and block-batched dispatch. Checked directly: **zero
+  occurrences of PC `$80`-`$84` anywhere in a 20,000-record ring spanning the fork point, in either build** --
+  this code path simply isn't running nearby, so it isn't the mechanism here.
+
+- *Re-read `func_00025b` itself* (the subroutine gated by the `Y:$6` bit 0 check): it is **not** idempotent
+  "run-once setup" as first assumed. It reads through a data table via `(r0)+` auto-increment and dispatches
+  on flag bits pulled from each entry (`jset #$c,x1,...`, `jclr #$8,x1,...` etc.) -- the classic shape of "pop
+  and process the next item from a queue" (most likely a pending parameter-change/MIDI-event queue for this
+  synth engine), not a one-time initialization routine. That reframes what `Y:$6` bit 0 actually is: more
+  likely a "there's a queued item, and it's been serviced this pass" latch than a "boot setup done" flag.
+
+**Refined interpretation:** the fork is very likely a genuine **scheduling/timing variance in exactly when a
+queued event gets serviced relative to other DSP work**, not a wrong-computation bug in any single opcode.
+An interpreter (strictly one instruction at a time, checking everything at maximum granularity) and a
+block-batched recompiler (checking interrupts/coarser conditions only between fused blocks) can legitimately
+service an asynchronous or queued event at a different *relative* point in the instruction stream while both
+remaining individually "correct" -- and once one build services it a few instructions earlier or later than
+the other, real register state (here, whatever `func_00025b` computes from the queue entry) will differ from
+that point on, which is exactly what was observed. This is a harder class of problem than a decode/miswrite
+bug: achieving true bit-exactness would mean matching event-service timing at instruction granularity between
+a per-instruction interpreter and a block-based recompiler, which cuts against the recompiler's entire
+performance rationale.
+
+**Practical next steps, in order of effort:** (1) determine what's actually enqueued/processed by
+`func_00025b` (inspect the data `r0` points to at the fork -- likely MIDI or a parameter change) to judge
+real-world audible impact: a several-instruction-early/late parameter update is a very different severity
+than a wrong sample. (2) If it matters audibly, the fix is architectural (make event/interrupt servicing
+granularity match the interpreter's, e.g. by forcing a block boundary wherever a pending event could be
+serviced) rather than a small local patch. (3) If it does *not* matter audibly -- plausible, since the first
+730 samples matched perfectly and this is boot-adjacent housekeeping, not the audio hot path -- Vavra's
+recompiler may already be good enough for real-world use despite this known, narrow, now well-understood gap
+from strict bit-exactness.
