@@ -1200,3 +1200,43 @@ serviced) rather than a small local patch. (3) If it does *not* matter audibly -
 730 samples matched perfectly and this is boot-adjacent housekeeping, not the audio hot path -- Vavra's
 recompiler may already be good enough for real-world use despite this known, narrow, now well-understood gap
 from strict bit-exactness.
+
+## Confirmed: it's an event-scheduling timing skew, not a data bug (2026-09-30, later still)
+
+**Did step (1) above.** Added `GM_QDUMP` (env-gated, `gm_probe.cpp`): whenever `func_00025b` is entered,
+dumps `r0` and 12 words of X: memory from there. `r0` is constant (`$0011a0`) every single call -- it's not
+a moving queue pointer, it's a **fixed event-record slot**, re-read each time. The first word there is a
+monotonically-incrementing counter (`...901, 902, 903, 800 (wrapped), 801, 802...`), with the following words
+looking like payload (`0x80063e`/`0x005737`/`0x000000`/`0x7fffff`-pattern data -- plausibly a MIDI note/CC
+event's parameters, `0x7fffff` being a common "max"/sentinel value for a 24-bit fixed-point field).
+
+**Confirmed directly, with concrete numbers, that this is a timing skew, not lost/duplicated/corrupted
+events.** Both builds process the exact same sequence of counter values in the same order -- no event is
+skipped or repeated. But right at the fork: **the recompiled build processes counter `$802` at cycle
+319,548,603, about 50 cycles *before* the previously-established fork point (~319,548,555-319,549,090)**;
+the interpreter's last captured call in the same window was still processing the *previous* counter value
+(`$801`) some 43,000 cycles earlier (cycle 319,505,356) and hadn't yet serviced `$802` by the time the ring
+capture ended. In other words: **the recompiled build simply notices and services a newly-arrived
+event a little sooner, in relative DSP-cycle terms, than the interpreter does** -- exactly the "event
+serviced at a different relative point in the instruction stream" mechanism theorized above, now backed by
+the actual event data rather than just control-flow shape.
+
+**Practical conclusion:** given the counter/payload words look like a single MIDI note or CC event (not
+audio-sample data), and the skew is on the order of tens to low hundreds of DSP cycles (microseconds, well
+below a single audio sample period), this is very likely an **inaudible, sub-sample timing jitter in exactly
+when a MIDI event's parameters get applied** -- not corrupted audio and not a functional bug in the usual
+sense. Combined with the earlier finding that the first 730 output samples matched bit-for-bit, the practical
+read is: **Vavra's recompiler is very likely usable for real-world listening despite this known, now fully
+understood gap from strict bit-exactness.** Actually eliminating the gap would mean matching MIDI/event
+servicing granularity to the interpreter's at the block-dispatch level, which is an architectural change (and
+in tension with the whole performance rationale for block-based recompilation) -- not recommended unless a
+concrete audible artifact is found that traces back to this.
+
+**If this needs to be revisited:** the two clean next diagnostics are (a) decode the event payload fully
+against this ROM's actual MIDI/event-record format (need the mqLib source's parameter-event struct layout) to
+confirm it's a note/CC and not something more consequential like a patch-load or voice-allocation event, and
+(b) extend `GM_QDUMP` to also log whichever code *sets* the incrementing counter (the uC-to-DSP event
+delivery path, likely via HDI08) to see exactly how the delivery timing itself differs between builds --
+though per the earlier uC-side interleaved trace work, the 68k's own instruction/cycle stream was shown to
+match the interpreter's for a very long stretch, so the skew's origin is more likely inside the DSP-side
+scheduling (block dispatch checking for events less granularly) than the uC side re-introducing timing drift.

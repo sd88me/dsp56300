@@ -166,6 +166,14 @@ void dumpRingAndExit() {
 	_exit(0);
 }
 void hookDsp(dsp56k::DSP* d, dsp56k::TWord pc) {
+	// one-off diagnostic: dump the queue-like data func_00025b consumes (via r0, in X: memory) whenever it's
+	// entered, to see what's actually being processed at the point the interpreter/recompiled builds fork.
+	if (pc == 0x25b && getenv("GM_QDUMP")) {
+		const auto r0 = d->regs().r[0].var;
+		fprintf(stderr, "QDUMP pc=25b r0=%06x cycles=%llu instr=%llu words:", r0, (unsigned long long)d->getCycles(), (unsigned long long)d->getInstructionCounter());
+		for (int i = 0; i < 12; ++i) fprintf(stderr, " %06x", d->memory().get(dsp56k::MemArea_X, r0 + i));
+		fprintf(stderr, "\n");
+	}
 	Rec r{}; r.kind = 0; r.pc = pc; r.a = d->regs().a.var; r.b = d->regs().b.var; r.sr = d->regs().sr.var; r.cycles = d->getCycles(); r.instr = d->getInstructionCounter();
 	if (g_cycleStop) {
 		g_ring[g_ringPos % g_ring.size()] = r;
