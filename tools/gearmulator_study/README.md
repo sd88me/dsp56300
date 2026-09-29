@@ -38,12 +38,25 @@ differential comparator -- also already fixed for a tracer blind spot found alon
    `kind=2` byte-identical poll instruction found last session). Same code, same registers, different branch
    -> a memory/peripheral value at whatever address $0001db polls must differ between builds. Not scheduling
    drift, not decode, not cycle accounting.
-3. **Next concrete step:** identify what memory address the poll instruction at $0001db actually reads
-   (disassemble/check the discovery trace at that PC), then trace writes to that address backward from DSP
-   instruction #13,179,646 to find the first build-dependent write -- almost certainly a genuine
-   miscompilation of one specific opcode whose wrong output only becomes observable this far into execution.
-   Block-granularity and whole-loop coalescing are already ruled out for this (MAX_INSTR=1 + no-loop
-   still reproduced it in the previous session), so don't re-test those.
+3. **Done (2026-09-30, later): identified the register, ruled out a data-corruption theory, found a
+   methodology caveat.** $0001db polls bit 15 (`M_PCE`) of Timer2's TCSR (`$FFFF87`, `M_TCSR2` in
+   `timers.h`). Added `GM_DISASM=<hex>` (disassemble a P: memory window around a PC, in `gm_probe.cpp`) and
+   `GM_TCSR2LOG` (log every TCSR2 change with PC + instruction counter, in `timers.cpp`) -- both are
+   permanent, env-gated, zero-cost-when-unused diagnostics now. Result: the write values and event counts
+   for TCSR2 are *identical* between builds (57,923 events each, same sequence) -- not a data-corruption bug.
+   But the logged PC for the same logical event differs by a constant offset between builds, which points to
+   a **trace methodology caveat**: the recompiled build's trace hook fires once per fused block (avg
+   3.1 real instructions/block), stamped with the block's *starting* PC, so matching records by raw
+   `dspInstr` counter across builds doesn't guarantee comparing the same real moment. The earlier "PC
+   mismatch at matching dspInstr" finding is plausibly this artifact, not proof of one instruction branching
+   differently on identical state.
+4. **The bug is still real, confirmed independent of tracing:** a plain 20-audio-second render gives
+   different hashes (interpreter `df13dfba3901a669` vs recompiled `c793b429768eb629`).
+5. **Next concrete step:** stop trying to align per-instruction traces across builds with different natural
+   granularities (block vs instruction). Instead **bisect on the audio output directly** -- compare
+   sample-by-sample (not just a whole-run hash) between builds to find the first differing sample, then
+   correlate its timestamp back to a DSP cycle/instruction count via the ESAI clock math to find the
+   surrounding code region. This sidesteps the block-vs-instruction mismatch entirely.
 3. Once bit-exact (or a second real bug is found and fixed), re-measure Force timing (last measured: 4.75x
    real time, worse than the interpreter's own eventual target of 100%; a proper Stage-3-style optimisation
    pass, never done for this synth, is likely needed before it's usable in the port).
