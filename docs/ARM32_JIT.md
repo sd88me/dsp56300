@@ -944,3 +944,49 @@ alongside pc/a/b/sr/dspCycles) -- keep it, it was essential for this pass. The o
 instrumentation used to confirm the tracer bug was reverted (not kept); the `s_recompTraceHook` calls added
 to `execRecompiledLoopBody()`/`execRecompiledLoop()` in `dsp.h` are kept permanently -- any future
 recompiler diagnostic work depends on the tracer actually seeing every instruction.
+
+## uC side instrumented, and the 68k-timing theory is now disproven (2026-09-30)
+
+**Instrumented the 68k side.** Added `mc68k::Mc68k::s_traceHook` (`source/cpu/mc68k/mc68k.h`/`.cpp`, gated by
+`DSP56K_RECOMP_DISCOVERY`), called once per uC instruction from `Mc68k::exec()` with its PC and cycle count --
+mirrors the DSP-side hook. `gm_probe.cpp`'s `GM_REGTRACE` writer gained `GM_REGTRACE_UC=1`, which installs it
+and interleaves DSP and uC events into one trace file in true call order (`kind` byte: 0=DSP, 1=uC), so the
+scheduling order itself can be compared between builds, not just each side's own counters. Committed as
+`388914cb`.
+
+**Ran it: 100M-record interleaved traces, interpreter vs. recompiled, both built with
+`-DDSP56K_RECOMP_DISCOVERY -DGM_LOCKSTEP` (recompiled also `-DDSP56K_RECOMP -I<fixed .inl dir>`).** First
+diff attempt used a naive Python script that materialized every record into a list of tuples -- with ~100M
+records per trace this meant tens of GB of Python object overhead, which appears to have crashed the host
+VM outright (not just the process) at least twice, wasting real time before the actual cause was identified.
+Rewrote as an `mmap` + generator two-pointer diff (`diff_uc3.py`, kept at `tools/gearmulator_study/` -- see
+below) with flat memory use; that ran cleanly to completion as a background task.
+
+**Result: the uC event stream DOES diverge eventually (at uc-event #15,667,848: interpreter at
+PC=$089f82/cycles=63949182 vs. recompiled at PC=$089f8e/cycles=63949180) -- but this is downstream of, not
+the cause of, a DSP-side divergence found earlier in the same trace (by file position).** At DSP instruction
+counter 13,179,646, both builds show identical DSP cycle count (20,724,672), identical `sr`, identical `a`/`b`
+registers -- but the interpreter's PC is $0001e6 while the recompiled build's is still $0001db. $0001db is the
+same `kind=2` poll instruction identified in the previous session (always interpreter-only, byte-identical
+machine code in both builds). Since the exact same C++ handler executes in both builds for this instruction,
+and every DSP register the trace captures matches, the only way it can branch differently is if **a
+memory/peripheral value it polls (not captured by the a/b/sr/cycle trace) differs between builds at this
+point** -- not an instruction-decode bug, not a cycle-accounting bug, and (per the uC evidence, which diverges
+*later* in the trace) not a 68k-side scheduling drift causing this. The 68k-timing hypothesis from the
+previous session's writeup is therefore disproven as the root cause; the 68k drift is a symptom that shows up
+after the fact, once the DSP has already gone down a different path.
+
+**Not yet found: which earlier instruction writes the wrong value to whatever memory/peripheral address
+$0001db polls.** That's the next concrete step -- extend the DSP-side trace record to also capture the
+specific memory word(s) $0001db reads (need to identify the instruction/operand first, e.g. via
+`dumpAssembly`/disassembly at $0001db in the discovery output) and trace writes to that address going
+backward from instruction #13,179,646 to find the first build-dependent write. Block-granularity and
+whole-loop coalescing were already ruled out for this exact bug in the previous session (MAX_INSTR=1 combined
+with no-loop still reproduced it), so the miswrite -- if that's what it is -- isn't a peripheral-tick-timing
+artifact of block coalescing; it's more likely a genuine miscompilation of one specific opcode that only
+shows an observable effect this far into execution.
+
+New file: `tools/gearmulator_study/diff_uc3.py` (the mmap/generator differential comparator used for this
+pass -- memory-safe for 100M+-record traces, unlike a naive list-based version). Trace files themselves
+(`trace_int2.bin`, `trace_rc3.bin`, ~4.8GB each) are not committed -- kept on real disk at
+`/home/sam/scratch-gm/`, regenerable via the build+run steps in `README.md`.

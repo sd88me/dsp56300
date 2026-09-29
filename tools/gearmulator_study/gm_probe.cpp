@@ -17,7 +17,7 @@
 #include "synthLib/romLoader.h"
 #include "baseLib/logging.h"
 #include "dsp56kEmu/dsp.h"
-#include "mc68k.h"
+#include "mc68k/mc68k.h"
 
 #if defined(GM_SYNTH_VIRUS)
 #include "virusLib/device.h"
