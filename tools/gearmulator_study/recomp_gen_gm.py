@@ -107,12 +107,20 @@ def handler(off):
     if off not in syms: raise KeyError(f'no symbol for handler offset {off:x}')
     return syms[off]
 
+# Entry points only need a block that STARTS there; they don't have to end the block before them. Most traced entries are
+# resume points after an interrupt, i.e. almost any instruction of a hot loop, and splitting at them shattered the hottest
+# DO loop bodies into one-instruction blocks (one dispatch + interrupt check per instruction). Blocks now end only at
+# structural leaders (after a block-ending instruction, after a DO loop end); an entry inside a block gets its own
+# overlapping block from there. Blocks are straight-line code keyed by start PC, so overlap is safe.
+# RECOMP_SPLIT_ENTRIES=1 restores the old splitting.
+import os
+split_at = leaders if os.environ.get('RECOMP_SPLIT_ENTRIES') else leaders - (entries - {la + 1 for la in loopends} - {pc + i['len'] for pc, i in ins.items() if i['kind'] != 0})
 blocks = []
 for start in sorted(leaders):
     if start not in ins or ins[start]['kind'] == 2: continue
     pcs, pc = [], start
     while pc in ins and ins[pc]['kind'] != 2 and len(pcs) < MAX_INSTR:
-        if pcs and pc in leaders: break
+        if pcs and pc in split_at: break
         pcs.append(pc)
         if ins[pc]['kind'] == 1: break
         pc += ins[pc]['len']
@@ -211,7 +219,7 @@ out.append('\treturn &program;')
 out.append('}')
 assert len(blocks) < 65535
 print('\n'.join(out))
-covered = sum(ins[pc]['count'] for b in blocks for pc in b)
+covered = sum(ins[pc]['count'] for pc in {pc for b in blocks for pc in b})   # overlapping blocks: count each PC once
 alln = sum(i['count'] for i in ins.values())
 sys.stderr.write(f'{len(blocks)} blocks, {total_instr} instructions, avg {total_instr/len(blocks):.1f}/block, '
                  f'max {maxw} words; covers {100*covered/alln:.2f}% of executed instructions; '

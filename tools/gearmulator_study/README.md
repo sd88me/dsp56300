@@ -124,6 +124,9 @@ differential comparator -- also already fixed for a tracer blind spot found alon
 15. **Done (evening): implemented as a per-PC verified-block table (`m_recompFast`)** -- bit-exact, ~6% DSP
     CPU on the Force (see ARM32_JIT.md). Line-level profile showed the real cost is multi-block DO-loop bodies
     dispatching block-by-block. **Next:** whole-loop generation for multi-block bodies in `recomp_gen_gm.py`.
+    **Then: overlapping blocks** (`recomp_gen_gm.py` no longer splits at traced entries, which had shattered the
+    hottest loops into 1-instruction blocks): **2.80x -> 1.55x** on the Force. Next: re-profile; the DSP thread is
+    ~1.6x and the 68k thread ~1.0x real time on their own.
     Original note: hoist block resolution out of `do_exec`'s
     per-iteration loop for the common case (PC unchanged, not invalidated), verify bit-exact output is
     unchanged (re-run the audio hash against the interpreter, same gate every Stage-3 step used), then

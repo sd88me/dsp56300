@@ -1396,3 +1396,27 @@ Modest. The bigger remaining lever the profile points at is structural: extend `
 (`recompLoop`) generation to multi-block DO-loop bodies, so those loops stop paying a per-block dispatch +
 interrupt check per iteration. Other DSP-thread costs in the same profile: `dspExecPeripherals` (~4000
 samples), `DSPThread::threadFunc` (~3300), hottest single block `recompBlock<548>` (~1800).
+
+### Overlapping blocks: stop splitting at traced entry points (2026-09-30, evening) -- 2.80x -> 1.55x on the Force
+
+Per-loop analysis of the discovery trace (hottest DO loops = ~40% of executed DSP instructions) showed the real reason
+do_exec dispatched block-by-block: the hottest loop bodies were **shattered into one-instruction blocks**, because
+almost every instruction in them is a traced "entry" (a resume point after an interrupt), and the generator ended a
+block at every entry. E.g. `do@$5a5`, 15 instructions, 12 blocks; `do@$9ea`, 12 instructions, 12 blocks.
+
+`recomp_gen_gm.py` now ends blocks only at structural leaders (after a block-ending instruction, after a DO loop
+end); every entry still gets a block *starting* there, overlapping the enclosing one. Blocks are straight-line code
+keyed by start PC, so overlap is safe (invalidation already scans maxWords back). `RECOMP_SPLIT_ENTRIES=1` reproduces
+the old `.inl` byte-for-byte. Result: avg 6.5 instructions/block (was 3.1), 176 whole-loop blocks (was 83).
+
+- **x86 lock-step, 20s:** wall 11.2s -> 8.0s.
+- **Force, non-lockstep, 10s, alternating twice:** wall 2.80x/2.81x -> **1.56x/1.54x**, DSP thread CPU 28.3s -> 16.0s
+  (-44%). 68k thread ~9.7s (~0.97x real time on its own).
+- **Output:** no longer bit-identical to the previous recompiled build (interrupts are now serviced at coarser block
+  boundaries). Against the interpreter it matches *longer* (first differing frame 1858, was 730). 100ms loudness
+  envelopes vs the interpreter: median 0.04 dB (old build 0.02 dB); outliers only around the 15-17s program changes,
+  where the interpreter has a ~100ms patch-load mute, the old recompiled build ~200ms and the new one none -- the same
+  class of uC/DSP timing sensitivity the old build already had there, not corrupted audio. Worth a listen.
+
+Remaining: DSP ~1.6x and 68k ~1.0x of real time per thread on a 2-core device, so both still need work before
+real-time. ~1.47M interpreted DSP instructions/s remain (uncovered PCs, DO/REP/Movep, etc.) -- next profile target.
