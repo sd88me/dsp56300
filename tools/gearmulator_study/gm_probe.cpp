@@ -322,6 +322,8 @@ int main(int argc, char** argv)
 		dev->process(ins, outs, block, midiIn, midiOut);
 		if (getenv("GM_PROGRESS") && (b & 0x3ff) == 0)
 			fprintf(stderr, "progress: block=%llu/%llu instr=%llu\n", (unsigned long long)b, (unsigned long long)blocks, (unsigned long long)dsp56k::DSP::execCountAll());
+		if (getenv("GM_WALLPROGRESS") && (b % static_cast<uint64_t>(atoi(getenv("GM_WALLPROGRESS"))) == 0))
+			fprintf(stderr, "wallprogress: block=%llu/%llu wall=%.3f\n", (unsigned long long)b, (unsigned long long)blocks, std::chrono::duration<double>(clk::now() - t0).count());
 		if (getenv("GM_SAMPLELOG") && b < static_cast<uint64_t>(atoi(getenv("GM_SAMPLELOG"))))
 			fprintf(stderr, "sampleblock b=%llu sample0=%llu instr=%llu cycles=%llu\n",
 				(unsigned long long)b, (unsigned long long)(b * block), (unsigned long long)dsp56k::DSP::execCountAll(),

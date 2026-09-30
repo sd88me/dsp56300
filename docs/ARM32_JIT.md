@@ -1240,3 +1240,43 @@ delivery path, likely via HDI08) to see exactly how the delivery timing itself d
 though per the earlier uC-side interleaved trace work, the 68k's own instruction/cycle stream was shown to
 match the interpreter's for a very long stretch, so the skew's origin is more likely inside the DSP-side
 scheduling (block dispatch checking for events less granularly) than the uC side re-introducing timing drift.
+
+**Cross-checked against `mpc-vst-machinedrum`'s own gearmulator-md-mm fork** (a separate, VE-enhanced fork the
+user maintains for Machinedrum/Monomachine work), specifically `doc/vavra_performance_regression_223.md`.
+Its source comment for the exact same protocol reads: `// BatchComplete: move n6,y:$6 => Y:$6 = N6 (bit 0 = 0
+= pending)` -- an independent, canonical confirmation that `Y:$6` bit 0 is exactly the documented HDI08
+BatchStart/BatchComplete command-processing flag this session reverse-engineered from the disassembly alone.
+That doc also lists specific performance regressions in the VE fork (HDI08 RX rate limit 0->100, a mutex on
+every HDI08 word transfer, a TXDE back-pressure wait, batch-sync `ucYieldLoop` calls) -- checked our upstream
+`dsp56300/gearmulator` checkout directly: none of these are present (`setRXRateLimit(0)`, no mutex), so this
+codebase doesn't carry that fork's regressions.
+
+## Performance: confirmed ~4.75x real time, and it's genuinely that slow (2026-09-30, later still)
+
+**Re-measured Vavra's recompiled build on the Force directly** (armhf cross-build, same flags as the earlier
+"fixed" build: `NO_JIT_RUNTIME, EXEC_STATS, INTERP_DEFAULT, INTERP_CYCLES, SPIN_SKIP, GM_LOCKSTEP, RECOMP`,
+`-I recomp-mq`, `taskset -c 3`). First attempt showed alarming, seemingly-growing slowdown with run length
+(10s audio: 4.53-5.16x; 30s: 4.86x; 60s: 7.70x, with the last 30s segment alone implying ~10.5x) and CPU
+frequency/thermal checks (`scaling_cur_freq` pinned at 1.8GHz throughout, temp 67-69C, `performance` governor)
+ruled out thermal throttling as the cause.
+
+**Root cause of the noisy numbers: the user was using Machinedrum on the same physical device at the time.**
+Once confirmed quiet, five independent 10-second runs came back at **4.73-4.75x, essentially zero variance**
+-- matching the previously-recorded 4.75x almost exactly. So the apparent quadratic slowdown was real-world
+background interference on shared, live hardware (exactly what the Monomodule Stage-3 benchmarking notes
+warned about: "don't benchmark without pacing/isolation, a live device has other processes"), not a bug in
+Vavra's own code. Good to have ruled out, but it also means: **this is the real, honest, steady-state number
+for the current codebase. There is no hidden quick win here** -- the earlier hope that a "Stage 3 pass" would
+improve it doesn't apply, because Stage 3's wins are in the *shared* DSP56300 core (dead-CCR elimination,
+`alu_mpy`, AGU fast paths, HDI08 TX polling, etc. -- all already in this fork's git history and used by every
+synth built from it, Vavra included). **Vavra's 4.75x already includes every one of those optimizations.**
+Getting real-time would need genuinely new, Vavra/mQ-specific optimization work (its own hot-path profile,
+its own interpreter-fallback coverage, its own peripheral-emulation cost), not re-running work already done
+for Monomodule.
+
+**Practical assessment for "is a port feasible":** correctness looks solid (one narrow, likely-inaudible
+timing gap, fully understood). Performance does not: ~4.75x means roughly 5x too slow for real-time on this
+hardware, and that's already with the best shared-core optimizations applied. A real-time Vavra port would
+need a dedicated optimization pass at least as involved as Monomodule's Stage 3 was, targeted at this
+specific ROM's hot paths (no profiler tooling for this was set up this session -- no `perf` binary was
+available on the Force and building/deploying a static one is the natural next step if this is pursued).
