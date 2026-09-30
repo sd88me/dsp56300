@@ -1420,3 +1420,19 @@ the old `.inl` byte-for-byte. Result: avg 6.5 instructions/block (was 3.1), 176 
 
 Remaining: DSP ~1.6x and 68k ~1.0x of real time per thread on a 2-core device, so both still need work before
 real-time. ~1.47M interpreted DSP instructions/s remain (uncovered PCs, DO/REP/Movep, etc.) -- next profile target.
+
+### Re-profile after overlapping blocks (2026-09-30, night): the easy wins are gone
+
+`perf record -F 4000` on the Force, 8s, non-lockstep `-g` build (1.58x RT this run; DSP thread 13.1s CPU, 68k 8.6s,
+main 2.7s). Samples: DSP thread 48.6%, 68k thread 40.9%, main 10.5%.
+
+DSP thread by category: **66.6% inside recompiled blocks/loops** (hottest `recompLoop<$5a7>` 5.7%, `<$223>` 4.3%, then a
+flat tail), dispatch (do_exec/threadFunc) 9.6%, peripherals 9.0%, interpreted instructions 6.8%. The hot loops are
+dense multiply/move sequences already using Stage-3 variants (dead-CCR `op_Multiply_T<false>`, reordered moves).
+Even removing *all* non-recompiled overhead would only take the DSP thread from ~1.6x to ~1.1x real time; getting it
+under 1.0x needs the recompiled code itself to get faster (e.g. keeping DSP registers in host registers across a block,
+dropping the A/B latch copies), which is a compiler project, not a tuning pass.
+
+68k thread (~1.0x real time on its own): `mqLib::Hardware::processUcCycle` 11.4%, `m68k_execute` 10.6%, `Gpt::exec`
+7.0%, `Mc68k::exec` 6.2%, `MqMc::exec` 5.6%, `Qsm::exec` 3.7% -- per-cycle peripheral ticking around Musashi, i.e.
+gearmulator's own uC emulation cost, untouched by this project.
