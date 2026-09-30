@@ -1331,3 +1331,47 @@ Vavra's actual voice/filter code (distinct from Monomodule's), and look for Stag
 specific to them (dead-CCR variants not yet covered, parallel-move latch overhead, etc.). (3) Investigate
 whether `do_exec`'s remaining share (still present, just smaller, without `GM_LOCKSTEP`) has its own
 avoidable overhead independent of the lockstep scheduler.
+
+## Confirmed `do_exec` is a real, scheduling-independent hot spot, and found the exact fix shape (2026-09-30, later still)
+
+**Re-profiled the non-`GM_LOCKSTEP` build** (fresh `-g` armhf build, same flags minus `GM_LOCKSTEP`,
+`perf record -F 4000` on the Force): `DSP::do_exec` is **still 14.65% of all samples** -- essentially
+unchanged from the lockstep build's 14.77%. This confirms `do_exec`'s cost is not a lockstep-scheduler
+artifact at all; it's a genuine, real hot function regardless of threading model, and the single biggest
+individual target for optimization (every individual `recompBlock<N>`/`recompLoop<N>` is under ~1.3%
+individually, hundreds exist).
+
+**`perf annotate`/`--sort=srcline` didn't work on this device** (no `objdump` binary at all; `perf report
+--sort=srcline` failed on its internal buildid-cache lookup) -- noted for next time: either install a static
+`objdump` alongside the `perf` bundle, or extract raw sample IPs via `perf script -F ip` and resolve them
+locally against the `-g` binary with the cross-toolchain's own `addr2line` (the approach Monomodule's
+`prof.sh` used) rather than relying on-device tooling. Not pursued further this session -- the function-level
+data plus reading `do_exec()`'s own source was enough to find a concrete lead without it.
+
+**Found the specific mechanism, by inspection of `do_exec()` (`dsp.cpp`):** its per-iteration loop
+(`while(reg.sc.var >= stackCount) { ... if(!execRecompiledLoopBody()) execInterpreter(); ... }`) calls
+`execRecompiledLoopBody()` (`dsp.h`) **fresh on every single iteration**. That function re-derives the block
+index from PC (`pc - m_recomp->base`, an index-array lookup) and re-validates it
+(`b.pc + b.numWords != reg.la.toWord() + 1`, `recompVerify(bi)`) each time -- but for a stable loop, PC
+returns to the exact same address every iteration, so this lookup and validation are **loop-invariant** and
+could be hoisted: resolve and validate the block once before the `while`, then call `b.func(this)` directly
+in the hot loop for the common (block unchanged) case, falling back to the full re-derivation only if
+`recompInvalidate()` has touched that PC since (a rare, self-modifying-code path already handled elsewhere).
+
+**Why this specifically matters for Vavra:** `recomp_gen_gm.py`'s `loop_body_ok()` only fuses a DO loop into
+the fully-optimized `recompLoop<PC>` path (Monomodule's own proven "run the whole loop from do_exec" Stage-3
+win, commit `59a12d1c`) when the loop body contains *only* plain instructions -- this ROM's trace has just 83
+such whole-loop blocks out of 902 total. Every other DO loop in Vavra's ROM still pays the slower
+per-iteration `execRecompiledLoopBody()` re-validation on every pass, which is very plausibly why `do_exec`
+shows up this hot: not because DO loops are inherently expensive, but because most of *this ROM's* loop
+bodies contain at least one `LOOP_UNSAFE` instruction (any of `Jclr/Jset/Brclr/Brset/Jsr/Bsr/...`) that
+disqualifies them from the whole-loop fusion, falling back to a path with real, hoistable per-iteration
+overhead that was never specifically optimized (Monomodule's Stage 3 optimized the whole-loop path, not this
+fallback one).
+
+**Not implemented this session** -- this needs a careful, correctness-verified change (re-run the bit-exact
+hash check against the interpreter after any change to `execRecompiledLoopBody()`'s dispatch, the same way
+every Stage-3 step for Monomodule was gated) and a full rebuild/redeploy/re-measure cycle, which wasn't
+completed in the time available. **This is the concrete, well-scoped next step**: hoist the block
+resolution out of `do_exec()`'s per-iteration loop for the common (PC-unchanged, not invalidated) case,
+verify bit-exact output is unchanged, then re-measure on the Force.
