@@ -150,6 +150,7 @@ namespace dsp56k
 		// static recompilation (see recompProgram)
 		const RecompProgram*			m_recomp = nullptr;
 		std::vector<uint8_t>			m_recompState;		// per block: 0 = not verified, 1 = verified, 2 = P words differ
+		std::vector<const RecompBlock*>	m_recompFast;		// PC - base -> block starting there, only while verified (one load on the hot path)
 		uint64_t						m_recompExecuted = 0;
 
 		ASMJIT_FORCE_INLINE bool execRecompiled(const TWord _pc) noexcept
@@ -159,14 +160,17 @@ namespace dsp56k
 			const TWord i = _pc - m_recomp->base;
 			if(i >= m_recomp->indexSize)
 				return false;
-			const auto bi = m_recomp->index[i];
-			if(!bi)
-				return false;
-			if(ASMJIT_UNLIKELY(m_recompState[bi] != 1) && !recompVerify(bi))
-				return false;
+			const RecompBlock* pb = m_recompFast[i];
+			if(ASMJIT_UNLIKELY(!pb))
+			{
+				const auto bi = m_recomp->index[i];
+				if(!bi || !recompVerify(bi))
+					return false;
+				pb = &m_recomp->blocks[bi];
+			}
 			if(m_processingMode == FastInterrupt)
 				return false;
-			const auto& b = m_recomp->blocks[bi];
+			const auto& b = *pb;
 			// an active DO loop that ends strictly inside this block: do_exec must see pc == la+1 after that
 			// instruction, so interpret instead
 			if((reg.sr.var & SR_LF) && TWord(reg.la.var - _pc) < b.numWords - 1)
@@ -187,13 +191,19 @@ namespace dsp56k
 			const TWord i = pc - m_recomp->base;
 			if(i >= m_recomp->indexSize)
 				return false;
-			const auto bi = m_recomp->index[i];
-			if(!bi)
-				return false;
-			const auto& b = m_recomp->blocks[bi];
+			const RecompBlock* pb = m_recompFast[i];
+			if(ASMJIT_UNLIKELY(!pb))
+			{
+				const auto bi = m_recomp->index[i];
+				if(!bi)
+					return false;
+				const auto& sb = m_recomp->blocks[bi];
+				if(sb.pc + sb.numWords != reg.la.toWord() + 1 || !recompVerify(bi))
+					return false;
+				pb = &sb;
+			}
+			const auto& b = *pb;
 			if(b.pc + b.numWords != reg.la.toWord() + 1)
-				return false;
-			if(ASMJIT_UNLIKELY(m_recompState[bi] != 1) && !recompVerify(bi))
 				return false;
 			pcCurrentInstruction = pc;
 #ifdef DSP56K_RECOMP_DISCOVERY

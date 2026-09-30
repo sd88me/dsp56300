@@ -121,7 +121,10 @@ differential comparator -- also already fixed for a tracer blind spot found alon
     work**. Only 83 of 902 blocks in this ROM qualify for the fully-fused `recompLoop` path (Monomodule's
     proven whole-loop Stage-3 win) -- every other DO loop pays this per-iteration cost, which was never
     specifically optimized (Stage 3 targeted the whole-loop path, not this fallback one).
-15. **Not implemented yet -- this is the concrete next step:** hoist block resolution out of `do_exec`'s
+15. **Done (evening): implemented as a per-PC verified-block table (`m_recompFast`)** -- bit-exact, ~6% DSP
+    CPU on the Force (see ARM32_JIT.md). Line-level profile showed the real cost is multi-block DO-loop bodies
+    dispatching block-by-block. **Next:** whole-loop generation for multi-block bodies in `recomp_gen_gm.py`.
+    Original note: hoist block resolution out of `do_exec`'s
     per-iteration loop for the common case (PC unchanged, not invalidated), verify bit-exact output is
     unchanged (re-run the audio hash against the interpreter, same gate every Stage-3 step used), then
     rebuild/redeploy/re-measure on the Force. `objdump` isn't on-device for `perf annotate`; use

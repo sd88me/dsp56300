@@ -148,7 +148,10 @@ namespace dsp56k
 
 		m_recomp = recompProgram();
 		if(m_recomp)
+		{
 			m_recompState.assign(m_recomp->numBlocks, 0);
+			m_recompFast.assign(m_recomp->indexSize, nullptr);
+		}
 
 		resetHW();
 	}
@@ -1641,6 +1644,7 @@ aar0=$000008 aar1=$000000 aar2=$000000 aar3=$000000
 			}
 		}
 		m_recompState[_index] = 1;
+		m_recompFast[b.pc - m_recomp->base] = &b;
 		return true;
 	}
 
@@ -1658,12 +1662,16 @@ aar0=$000008 aar1=$000000 aar2=$000000 aar3=$000000
 		{
 			const TWord i = a - m_recomp->base;
 			if(i < m_recomp->indexSize && m_recomp->index[i])
+			{
 				m_recompState[m_recomp->index[i]] = 0;
+				m_recompFast[i] = nullptr;
+			}
 		}
 	}
 
 	void DSP::recompInvalidateAll() noexcept
 	{
 		std::fill(m_recompState.begin(), m_recompState.end(), uint8_t(0));
+		std::fill(m_recompFast.begin(), m_recompFast.end(), nullptr);
 	}
 }

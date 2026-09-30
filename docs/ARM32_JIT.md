@@ -1375,3 +1375,24 @@ every Stage-3 step for Monomodule was gated) and a full rebuild/redeploy/re-meas
 completed in the time available. **This is the concrete, well-scoped next step**: hoist the block
 resolution out of `do_exec()`'s per-iteration loop for the common (PC-unchanged, not invalidated) case,
 verify bit-exact output is unchanged, then re-measure on the Force.
+
+### Implemented the dispatch fix; resolved do_exec's samples line-by-line (2026-09-30, evening)
+
+Resolved the saved on-device sample IPs (`perf script -F ip,sym`) locally with the cross-toolchain's
+`addr2line -i` against the `-g` binary (load base 0x400000) -- this works where on-device `perf annotate`
+didn't. Of do_exec's 14.65%: **44% is the generic `execRecompiled()` fallback** (inlined via
+`execInterpreter()`), 27.5% `execRecompiledLoopBody()`, 12.6% do_exec's own loop, 7.3% the rest of
+`execInterpreter()`. So the cost is mostly DO loops whose body spans *several* blocks: `execRecompiledLoopBody()`
+declines (block doesn't end at LA), and each block then goes through `execInterpreter()` → interrupt check →
+`execRecompiled()`. The hottest lines were the dependent loads `index[] -> m_recompState[] -> blocks[]`.
+
+Fix: a per-DSP `m_recompFast` table (PC - base -> `const RecompBlock*`, non-null only while verified), set in
+`recompVerify()`, cleared in `recompInvalidate()`/`recompInvalidateAll()`. Hot path is now one load; the
+old chain is the cold path. **Bit-exact:** x86 lock-step 20s render hash unchanged (`c793b429768eb629`,
+identical instruction count). **Force, non-lockstep, 10s, alternating old/new twice:** DSP thread CPU
+31.4s/31.3s -> 29.6s/29.2s (~6%), wall 3.04x/3.15x -> 2.96x/2.95x.
+
+Modest. The bigger remaining lever the profile points at is structural: extend `recomp_gen_gm.py`'s whole-loop
+(`recompLoop`) generation to multi-block DO-loop bodies, so those loops stop paying a per-block dispatch +
+interrupt check per iteration. Other DSP-thread costs in the same profile: `dspExecPeripherals` (~4000
+samples), `DSPThread::threadFunc` (~3300), hottest single block `recompBlock<548>` (~1800).
