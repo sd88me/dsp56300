@@ -1280,3 +1280,54 @@ hardware, and that's already with the best shared-core optimizations applied. A 
 need a dedicated optimization pass at least as involved as Monomodule's Stage 3 was, targeted at this
 specific ROM's hot paths (no profiler tooling for this was set up this session -- no `perf` binary was
 available on the Force and building/deploying a static one is the natural next step if this is pursued).
+
+## Started the optimization pass: got `perf` on the Force, found the real bottleneck (2026-09-30, later still)
+
+**Got on-device profiling working.** No `perf` binary exists on the Force and none was bundled from earlier
+work. Built one: `dpkg --add-architecture armhf` inside `mnm-armhf-builder`, `apt-get install
+--download-only linux-perf:armhf` (pulls the full armhf dependency chain, 63 packages), extracted every
+`.so` from those debs into a bundle deployed alongside a `-g` build. **Caution for next time:** the first
+attempt set `LD_LIBRARY_PATH` for the whole SSH session including core glibc libs (`libc.so.6`, `libm.so.6`,
+`ld-linux-armhf.so.3`) bundled from a mismatched Debian version -- this broke basic system tools (`head`
+failed with a GLIBC version error) for the duration of that one shell. No lasting damage (scoped to that SSH
+invocation only), but the fix is to **exclude core glibc/loader libs from the bundle** (they're always
+already on the device) and only ever export `LD_LIBRARY_PATH` for the single `perf` invocation, never as a
+persistent session export. The trimmed bundle plus `perf record -F 4000` worked cleanly.
+
+**Result: 14.77% of all samples are in `DSP::do_exec` alone, and the full uC/DSP lockstep scheduling
+machinery (`lockstepStepDsp`, `processUcCycle`, `MqDsp::lockstepStep`, `Hardware::lockstepRun`,
+`dspExecPeripherals`, `m68k_execute`, the uC's own peripheral `exec()`s) sums to roughly 40% of total
+samples** -- dwarfing every individual recompiled block (each under ~1.2% individually; hundreds of them
+exist). This pointed at `GM_LOCKSTEP` itself: it was added purely as a **correctness-testing harness**
+(deterministic single-thread execution so recompiled output can be hashed against the interpreter's -- see
+"Vavra lock-step + recompiler attempt" above) -- never intended as the production design. Its comment
+("One exec() call per step, not a fixed batch... batching would let the DSP run far past HDI08 round-trips")
+confirms it deliberately serializes at maximum granularity for safety during boot's HDI08 handshake, and
+this has been running for every measurement all session, including the "confirmed ~4.75x" figure above.
+
+**Rebuilt without `GM_LOCKSTEP`** (normal gearmulator threading: real uC and DSP threads, natural HDI08
+buffering) and re-measured on the Force: **3.72x** -- a real, ~22% improvement, but far short of what the
+scheduling overhead's ~40% profile share might have suggested. The per-thread CPU breakdown explains why:
+for 10 audio-seconds, the `DSP A` thread alone consumed **28.70 CPU-seconds (2.87x) in complete isolation on
+its own thread**, `MC68331` (uC) 8.13s. **This is the real, scheduling-independent bottleneck: the recompiled
+DSP code itself needs to run about 2.87x faster than it currently does.** Removing the lockstep-induced
+scheduling overhead was worth doing (and is a legitimate, real win for any eventual production build) but it
+was never going to close a 4.75x gap on its own -- most of that gap is genuine DSP-side execution cost, the
+same category of problem Monomodule's Stage 3 solved for its own synth.
+
+**This is consistent with, not contradictory to, the earlier "Stage 3 is already applied" finding.** Stage
+3's wins are generic, shared-core optimizations (dead-CCR elimination, `alu_mpy`, AGU fast paths) that
+benefit any synth built from this fork equally -- Vavra already has them. What Vavra hasn't had is a
+profiling pass *of its own hot paths*, the same kind of iterative "measure, optimize the top offender,
+re-measure" work Stage 3's table documents for Monomodule. The `perf` data above is exactly the input that
+process needs; the individual `recompBlock<N>`/`recompLoop<N>` entries in the full report (`perf_report.txt`
+in the session's scratch area, not committed -- regenerable via the steps above) are where to start.
+
+**Next concrete steps:** (1) build the non-`GM_LOCKSTEP` threaded configuration into the standard
+benchmark path (it's a real, keepable win) alongside continuing to use `GM_LOCKSTEP` only for correctness
+verification, never performance measurement, going forward. (2) Use `addr2line`/disassembly on the hottest
+individual `recompBlock<N>` functions from the `perf` data to find what DSP56300 opcode patterns dominate
+Vavra's actual voice/filter code (distinct from Monomodule's), and look for Stage-3-style opportunities
+specific to them (dead-CCR variants not yet covered, parallel-move latch overhead, etc.). (3) Investigate
+whether `do_exec`'s remaining share (still present, just smaller, without `GM_LOCKSTEP`) has its own
+avoidable overhead independent of the lockstep scheduler.
