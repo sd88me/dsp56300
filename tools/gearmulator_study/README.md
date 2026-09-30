@@ -93,6 +93,29 @@ differential comparator -- also already fixed for a tracer blind spot found alon
     to the interpreter's at the block-dispatch level) would cut against the whole performance rationale for
     block-based recompilation -- not recommended without a concrete audible artifact to justify it. Full
     writeup in `docs/ARM32_JIT.md`.
+
+## Performance optimization pass: started, real bottleneck found (2026-09-30)
+
+11. **Got `perf` working on the Force** (none existed): `dpkg --add-architecture armhf` +
+    `apt-get download` in `mnm-armhf-builder`, bundled the extracted `.so` deps with a `-g` build.
+    **Caution:** don't bundle core glibc/loader libs or export `LD_LIBRARY_PATH` for a whole SSH session --
+    a first attempt broke basic system tools transiently (no lasting harm, scoped to that one session).
+    Exclude `libc.so*`/`libm.so*`/`ld-linux*` from the bundle; only export for the single `perf` call.
+12. **Found the real bottleneck.** `perf record` on the `GM_LOCKSTEP` build showed `do_exec` alone at 14.77%
+    of samples and the whole uC/DSP lockstep scheduling machinery at ~40% -- dwarfing individual recompiled
+    blocks. `GM_LOCKSTEP` was a correctness-testing harness we added (never the production design),
+    serializing to one `DSP::exec()` call per step for HDI08-boot-handshake safety -- and it's what every
+    performance measurement this session (including "confirmed 4.75x") used.
+13. **Rebuilt without `GM_LOCKSTEP`** (real threads, natural buffering): **3.72x** -- a genuine ~22%
+    improvement, but the per-thread CPU breakdown shows the real limit: the DSP thread alone burns 2.87x
+    real time in complete isolation. **That's the actual bottleneck** -- the recompiled DSP code itself needs
+    to run ~2.87x faster, the same category of gap Monomodule's Stage 3 closed for its own synth. Consistent
+    with (not contradicting) the earlier finding that Stage 3's generic wins are already included -- what's
+    missing is a profiling pass of Vavra's *own* hot paths, which this `perf` data is the input for.
+14. **Next steps:** fold the non-lockstep config into the standard bench path (real, keepable win);
+    `addr2line`/disassemble the hottest `recompBlock<N>` functions from the `perf` report to find
+    Vavra-specific Stage-3 opportunities; check whether `do_exec`'s remaining (smaller) share has its own
+    avoidable overhead. Full writeup in `docs/ARM32_JIT.md`.
 3. Once bit-exact (or a second real bug is found and fixed), re-measure Force timing (last measured: 4.75x
    real time, worse than the interpreter's own eventual target of 100%; a proper Stage-3-style optimisation
    pass, never done for this synth, is likely needed before it's usable in the port).
