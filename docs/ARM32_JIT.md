@@ -1436,3 +1436,24 @@ dropping the A/B latch copies), which is a compiler project, not a tuning pass.
 68k thread (~1.0x real time on its own): `mqLib::Hardware::processUcCycle` 11.4%, `m68k_execute` 10.6%, `Gpt::exec`
 7.0%, `Mc68k::exec` 6.2%, `MqMc::exec` 5.6%, `Qsm::exec` 3.7% -- per-cycle peripheral ticking around Musashi, i.e.
 gearmulator's own uC emulation cost, untouched by this project.
+
+### Option 2 (faster generated DSP code): first probe -- no cheap structural win (2026-09-30, night)
+
+Resolved the recompiled-code samples (66.6% of the DSP thread) to inlined handlers: `AGU::updateAddressRegister`
+~17% (the hot loops use **modulo** addressing, so the linear fast path doesn't apply), `alu_mpyT` ~9%,
+`limit_transfer` 5%, `isPeripheralAddress` 4.8% (re-reads SR every access), `Memory::get`/`dspWrite` ~6%, CCR
+helpers (`sr_set/clear/toggle`, `setCCRDirty`) ~8%, decode helpers ~5%. The hottest loop (`$5a7`, 15 DSP
+instructions) compiles to ~3300 ARM instructions including cold paths.
+
+Tested the obvious hypothesis -- that the compiler reloads DSP registers because emulated memory stores (TWord) may
+alias DSP register fields (int32): routed all `Memory` accesses through a distinct `MemWord` type. A compile test
+confirmed GCC then disambiguates, and the full build stayed bit-exact (hash `f0f7fc7999baece3`), **but the Force
+showed no gain** (DSP thread 15.7-16.1s either way), so it was reverted. Slow-path joins also turned out fine (the
+cold path reloads before rejoining). The remaining cost is genuine per-instruction work on a register-starved
+32-bit target: 56-bit accumulators, modulo AGU, saturation/limiting, CCR, per-access peripheral/MMU checks.
+
+Implication: closing the DSP thread's remaining ~1.6x -> <1.0x needs semantic specialisation in the generator, not
+compiler hints -- e.g. per-block guarded variants for the observed M-register modes (precomputed modulo bounds),
+eliding the per-access peripheral check when an address register provably stays in RAM, emitting ALU/AGU ops
+directly on locals instead of via the interpreter handlers. Each is a few percent to maybe ~10%; together plausibly
+~1.3x, uncertain whether <1.0x with headroom is reachable.
