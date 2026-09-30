@@ -112,10 +112,21 @@ differential comparator -- also already fixed for a tracer blind spot found alon
     to run ~2.87x faster, the same category of gap Monomodule's Stage 3 closed for its own synth. Consistent
     with (not contradicting) the earlier finding that Stage 3's generic wins are already included -- what's
     missing is a profiling pass of Vavra's *own* hot paths, which this `perf` data is the input for.
-14. **Next steps:** fold the non-lockstep config into the standard bench path (real, keepable win);
-    `addr2line`/disassemble the hottest `recompBlock<N>` functions from the `perf` report to find
-    Vavra-specific Stage-3 opportunities; check whether `do_exec`'s remaining (smaller) share has its own
-    avoidable overhead. Full writeup in `docs/ARM32_JIT.md`.
+14. **Done: confirmed `do_exec` is real, and found the exact fix shape.** Re-profiled the non-lockstep
+    build directly: `do_exec` is still 14.65% of samples (vs 14.77% with lockstep) -- genuinely hot, not a
+    scheduling artifact, and the single biggest individual target (every `recompBlock<N>` is under ~1.3%
+    each). By inspection of `do_exec()`'s source: its per-iteration loop calls `execRecompiledLoopBody()`
+    fresh every iteration, which re-derives and re-validates the block index from PC each time -- but for a
+    stable loop PC returns to the same address every iteration, so this is **loop-invariant, hoistable
+    work**. Only 83 of 902 blocks in this ROM qualify for the fully-fused `recompLoop` path (Monomodule's
+    proven whole-loop Stage-3 win) -- every other DO loop pays this per-iteration cost, which was never
+    specifically optimized (Stage 3 targeted the whole-loop path, not this fallback one).
+15. **Not implemented yet -- this is the concrete next step:** hoist block resolution out of `do_exec`'s
+    per-iteration loop for the common case (PC unchanged, not invalidated), verify bit-exact output is
+    unchanged (re-run the audio hash against the interpreter, same gate every Stage-3 step used), then
+    rebuild/redeploy/re-measure on the Force. `objdump` isn't on-device for `perf annotate`; use
+    `perf script -F ip` + the cross-toolchain's `addr2line` locally instead (Monomodule's `prof.sh` pattern)
+    if finer-grained profiling is needed. Full writeup in `docs/ARM32_JIT.md`.
 3. Once bit-exact (or a second real bug is found and fixed), re-measure Force timing (last measured: 4.75x
    real time, worse than the interpreter's own eventual target of 100%; a proper Stage-3-style optimisation
    pass, never done for this synth, is likely needed before it's usable in the port).
